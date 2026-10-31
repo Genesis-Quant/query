@@ -1,0 +1,685 @@
+"""定义查询源处理和 DSL 执行使用的 DolphinDB 函数。"""
+
+from query.database.compile import DolphinDBFunction
+from query.database.compile.common.functions import (
+    IS_DICTIONARY_FORM,
+    IS_SCALAR_FORM,
+    IS_TABLE_FORM,
+    IS_VECTOR_FORM,
+    REQUIRE_TABLE_COLUMNS,
+)
+
+FILL_NULL_COLUMN = DolphinDBFunction(
+    module="query",
+    definition="""
+    def fill_null_column(mutable source, name, value) {
+        // 使用指定标量替换单列中的 NULL，表内其他列保持不变。
+        require_table_columns(source, [string(name)], "fill_null_column")
+        source[string(name)] = nullFill(source[string(name)], value)
+        return source
+    }
+    """,
+    dependencies=(REQUIRE_TABLE_COLUMNS,),
+)
+
+FILL_OBSERVED_GROUP_NULL_COLUMN = DolphinDBFunction(
+    module="query",
+    definition="""
+    def fill_observed_group_null_column(mutable source, name, groups, value) {
+        // 只填充至少包含一个有效值的组；整组缺失时保留 NULL。
+        require_table_columns(
+            source,
+            [string(name)],
+            "fill_observed_group_null_column"
+        )
+        if (!is_vector_form(groups) || size(groups) != source.rows()) {
+            throw "fill_observed_group_null_column 的 groups 必须与 source 等长"
+        }
+        if (source.rows() == 0) return source
+
+        values = source[string(name)]
+        observed = contextby(any, !isNull(values), groups)
+        source[string(name)] = iif(
+            observed,
+            nullFill(values, value),
+            values
+        )
+        return source
+    }
+    """,
+    dependencies=(IS_VECTOR_FORM, REQUIRE_TABLE_COLUMNS),
+)
+
+FORWARD_FILL_COLUMN = DolphinDBFunction(
+    module="query",
+    definition="""
+    def forward_fill_column(mutable source, name, groups, order) {
+        // 按 groups 分组并按 order 排序，对单列执行前向填充。
+        require_table_columns(source, [string(name)], "forward_fill_column")
+        if (!is_vector_form(groups) || size(groups) != source.rows()) {
+            throw "forward_fill_column 的 groups 必须与 source 等长"
+        }
+        if (!is_vector_form(order) || size(order) != source.rows()) {
+            throw "forward_fill_column 的 order 必须与 source 等长"
+        }
+        source[string(name)] = contextby(
+            ffill,
+            source[string(name)],
+            groups,
+            order
+        )
+        return source
+    }
+    """,
+    dependencies=(IS_VECTOR_FORM, REQUIRE_TABLE_COLUMNS),
+)
+
+NORMALIZE_ON = DolphinDBFunction(
+    module="query",
+    definition="""
+    def normalize_on(on, n) {
+        // 校验 on 为 BOOL，将标量广播为 n 行向量，并把 NULL 统一视为 false。
+        if (type(on) != BOOL) {
+            throw "DSL 的 on 必须是 BOOL，实际类型为 " + typestr(on)
+        }
+        result = on
+        if (is_scalar_form(result)) result = take(result, n)
+        if (!is_vector_form(result) || size(result) != n) {
+            throw "DSL 的 on 必须是长度为 " + string(n) + " 的 BOOL 向量，实际为 " + typestr(result)
+        }
+        return nullFill(result, false)
+    }
+    """,
+    dependencies=(IS_SCALAR_FORM, IS_VECTOR_FORM),
+)
+
+RESTORE_MASKED_ROWS = DolphinDBFunction(
+    module="query",
+    definition="""
+    def restore_masked_rows(selected_result, mask, n) {
+        // 把筛选后的结果按 mask 回填到原始 n 行位置，未选中的行保持 NULL。
+        result = array(type(selected_result), n, n, NULL)
+        if (n == 0) return result
+        if (sum(mask) == 0) return result
+        indices = (0..(n - 1))[mask]
+        result[indices] = selected_result
+        return result
+    }
+    """
+)
+
+SAMPLE_OPERANDS = DolphinDBFunction(
+    module="query",
+    definition="""
+    def sample_operands(operands) {
+        // 从每个操作数取一个样本，供空筛选分支推断算符返回类型。
+        result = array(ANY, 0)
+        for (operand in operands) {
+            if (size(operand) == 0) result.append!(array(type(operand), 1, 1, NULL))
+            else result.append!(take(operand, 1))
+        }
+        return result
+    }
+    """
+)
+
+SELECT_OPERANDS = DolphinDBFunction(
+    module="query",
+    definition="""
+    def select_operands(operands, mask) {
+        // 使用同一个行掩码筛选全部操作数，并保持操作数顺序不变。
+        result = array(ANY, 0)
+        for (operand in operands) result.append!(operand[mask])
+        return result
+    }
+    """
+)
+
+APPLY_TIME_SERIES = DolphinDBFunction(
+    module="query",
+    definition="""
+    def apply_time_series(func, operands, on, code, time, empty_result) {
+        // on=NULL 时对全部行计算；否则筛选 true 行并把结果恢复到原始位置。
+        n = size(operands[0])
+        if (n == 0) return empty_result
+        if (type(on) == VOID) return contextby(func, operands, code, time)
+        mask = normalize_on(on, n)
+        if (sum(mask) == 0) {
+            sample = unifiedCall(func, sample_operands(operands))
+            return restore_masked_rows(sample, mask, n)
+        }
+        selected = contextby(func, select_operands(operands, mask), code[mask], time[mask])
+        return restore_masked_rows(selected, mask, n)
+    }
+    """,
+    dependencies=(
+        NORMALIZE_ON,
+        RESTORE_MASKED_ROWS,
+        SAMPLE_OPERANDS,
+        SELECT_OPERANDS,
+    ),
+)
+
+APPLY_CROSS_SECTION = DolphinDBFunction(
+    module="query",
+    definition="""
+    def apply_cross_section(func, operands, on, time, empty_result) {
+        // on=NULL 时对全部行计算；否则筛选 true 行并把结果恢复到原始位置。
+        n = size(operands[0])
+        if (n == 0) return empty_result
+        if (type(on) == VOID) return contextby(func, operands, time)
+        mask = normalize_on(on, n)
+        if (sum(mask) == 0) {
+            sample = unifiedCall(func, sample_operands(operands))
+            return restore_masked_rows(sample, mask, n)
+        }
+        selected = contextby(func, select_operands(operands, mask), time[mask])
+        return restore_masked_rows(selected, mask, n)
+    }
+    """,
+    dependencies=(
+        NORMALIZE_ON,
+        RESTORE_MASKED_ROWS,
+        SAMPLE_OPERANDS,
+        SELECT_OPERANDS,
+    ),
+)
+
+APPLY_GROUPED_CROSS_SECTION = DolphinDBFunction(
+    module="query",
+    definition="""
+    def apply_grouped_cross_section(func, operands, on, time, by, empty_result) {
+        // on=NULL 时不按 on 筛选；by=NULL 始终不参与分组截面计算。
+        n = size(operands[0])
+        if (n == 0) return empty_result
+        valid_group = !isNull(by)
+        if (type(on) == VOID && sum(valid_group) == n) {
+            return contextby(func, operands, (time, by))
+        }
+        mask = valid_group
+        if (type(on) != VOID) mask = normalize_on(on, n) && valid_group
+        if (sum(mask) == 0) {
+            sample = unifiedCall(func, sample_operands(operands))
+            return restore_masked_rows(sample, mask, n)
+        }
+        selected = contextby(func, select_operands(operands, mask), (time[mask], by[mask]))
+        return restore_masked_rows(selected, mask, n)
+    }
+    """,
+    dependencies=(
+        NORMALIZE_ON,
+        RESTORE_MASKED_ROWS,
+        SAMPLE_OPERANDS,
+        SELECT_OPERANDS,
+    ),
+)
+
+APPLY_CONTROLLED_CROSS_SECTION = DolphinDBFunction(
+    module="query",
+    definition="""
+    def apply_controlled_cross_section(func, target, controls, on, time) {
+        // 按交易日向控制变量截面函数传入 target 和 controls，并把结果回填到原始行。
+        n = size(target)
+        result = array(DOUBLE, n, n, NULL)
+        if (n == 0) return result
+        selected_indices = 0..(n - 1)
+        selected_time = time
+        if (type(on) != VOID) {
+            mask = normalize_on(on, n)
+            if (sum(mask) == 0) return result
+            selected_indices = selected_indices[mask]
+            selected_time = selected_time[mask]
+        }
+
+        for (current_date in distinct(selected_time)) {
+            row_indices = selected_indices[selected_time == current_date]
+            result[row_indices] = func(target[row_indices], controls[row_indices])
+        }
+        return result
+    }
+    """,
+    dependencies=(NORMALIZE_ON,),
+)
+
+BUILD_CONTROL_TABLE = DolphinDBFunction(
+    module="query",
+    definition="""
+    def build_control_table(values) {
+        // 将按顺序给出的控制变量向量组装成 control0、control1 等命名列的表。
+        if (size(values) == 0) throw "控制变量至少包含一列"
+        columns = dict(STRING, ANY)
+        for (index in 0..(size(values) - 1)) {
+            columns["control" + string(index)] = values[index]
+        }
+        return transpose(columns)
+    }
+    """
+)
+
+REQUIRE_KEY = DolphinDBFunction(
+    module="query",
+    definition="""
+    def require_key(object, key, location) {
+        // 校验 object 为字典且包含必填 key，错误信息保留 DSL 所在位置。
+        if (!is_dictionary_form(object)) {
+            throw location + " 必须是字典，实际类型为 " + typestr(object)
+        }
+        if (!(key in object)) throw location + " 缺少必填键 " + key
+        return object[key]
+    }
+    """,
+    dependencies=(IS_DICTIONARY_FORM,),
+)
+
+REQUIRE_VECTOR = DolphinDBFunction(
+    module="query",
+    definition="""
+    def require_vector(value, n, location) {
+        // 将标量或单元素向量广播为 n 行，并拒绝其他长度或数据形态不符合要求的结果。
+        result = value
+        if (is_scalar_form(result)) result = take(result, n)
+        if (is_vector_form(result) && size(result) == 1 && n != 1) result = take(result, n)
+        if (!is_vector_form(result) || size(result) != n) {
+            throw location + " 必须返回长度为 " + string(n) + " 的向量，实际为 " + typestr(result)
+        }
+        return result
+    }
+    """,
+    dependencies=(IS_SCALAR_FORM, IS_VECTOR_FORM),
+)
+
+REQUIRE_COLUMN = DolphinDBFunction(
+    module="query",
+    definition="""
+    def require_column(source, name, operation) {
+        // 读取算符必需的输入列；缺列时报告具体算符和列名。
+        if (!(name in columnNames(source))) {
+            throw operation + " 要求输入表包含列 " + name
+        }
+        return source[name]
+    }
+    """
+)
+
+EMPTY_FACTOR_TIMELINE = DolphinDBFunction(
+    module="query",
+    definition="""
+    def empty_factor_timeline(factors) {
+        // 构造带 selected 标记和请求 factor 的零行查询时间线。
+        result = table(
+            array(TIMESTAMP, 0) as time,
+            array(SYMBOL, 0) as code,
+            array(BOOL, 0) as selected
+        )
+        if (size(factors) > 0) {
+            addColumn(result, string(factors), take(DOUBLE, size(factors)))
+        }
+        return result
+    }
+    """
+)
+
+BUILD_FACTOR_SOURCE = DolphinDBFunction(
+    module="query",
+    definition="""
+    def build_factor_source(
+            data,
+            codes,
+            factors,
+            dates,
+            start_time,
+            end_time,
+            seed_factors) {
+        // 从统一长表完成筛选、交易日展开、事件时间线构造和长转宽。
+        if (!is_table_form(data)) {
+            throw "build_factor_source 的 data 必须是 table，实际为 " + typestr(data)
+        }
+        if (!is_vector_form(codes) || size(codes) == 0) {
+            throw "build_factor_source 的 codes 必须是非空向量"
+        }
+        if (!is_vector_form(factors) || (size(factors) > 0 && type(factors) != STRING)) {
+            throw "build_factor_source 的 factors 必须是 STRING 向量"
+        }
+        if (!is_vector_form(dates)) {
+            throw "build_factor_source 的 dates 必须是时间向量"
+        }
+        if (!is_vector_form(seed_factors)) {
+            throw "build_factor_source 的 seed_factors 必须是 STRING 向量"
+        }
+        if (size(seed_factors) > 0 && type(seed_factors) != STRING) {
+            throw "build_factor_source 的 seed_factors 必须是 STRING 向量"
+        }
+        invalid_seed_factors = string(seed_factors)[
+            !(string(seed_factors) in string(factors))
+        ]
+        if (size(invalid_seed_factors) > 0) {
+            throw "seed_factors 不在 factors 中：" +
+                concat(invalid_seed_factors, ", ")
+        }
+        if (size(dates) == 0) return empty_factor_timeline(factors)
+
+        code_table = table(symbol(codes) as code)
+        date_table = table(timestamp(dates) as time)
+        universe = select time, code, true as selected from cj(date_table, code_table)
+        if (size(factors) == 0) {
+            return select * from universe order by code, time
+        }
+
+        values = select timestamp(time) as time, code, factor, value
+            from data
+            where time >= start_time
+              and time < end_time
+              and factor in symbol(factors)
+              and code in symbol(codes)
+        if (size(seed_factors) > 0) {
+            historical = select timestamp(time) as time, code, factor, value
+                from data
+                where time < start_time
+                  and factor in symbol(seed_factors)
+                  and code in symbol(codes)
+                order by code, factor, time
+            latest = select
+                    last(time) as seed_time,
+                    last(value) as seed_value
+                from historical
+                group by code, factor
+            seeds = select
+                    seed_time as time,
+                    code,
+                    factor,
+                    seed_value as value
+                from latest
+            values = unionAll(values, seeds)
+        }
+        events = select time, code, false as selected from values
+        timeline = select max(selected) as selected
+            from unionAll(universe, events)
+            group by time, code
+
+        if (values.rows() == 0) {
+            wide = select time, code from values
+        } else {
+            wide = select first(value) from values pivot by time, code, factor
+        }
+        result = select * from lj(timeline, wide, ["time", "code"])
+            order by code, time
+
+        missing = string(factors)[!(string(factors) in columnNames(result))]
+        if (size(missing) > 0) {
+            addColumn(result, missing, take(DOUBLE, size(missing)))
+        }
+        reorderColumns!(
+            result,
+            ["time", "code", "selected"] join string(factors)
+        )
+        return result
+    }
+    """,
+    dependencies=(
+        EMPTY_FACTOR_TIMELINE,
+        IS_TABLE_FORM,
+        IS_VECTOR_FORM,
+    ),
+)
+
+FINALIZE_FACTOR_SOURCE = DolphinDBFunction(
+    module="query",
+    definition="""
+    def finalize_factor_source(source, factors) {
+        // 填充完成后删除事件行和 selected 标记，返回正式日频 source。
+        columns = ["time", "code", "selected"] join string(factors)
+        require_table_columns(source, columns, "finalize_factor_source")
+        selected = nullFill(source.selected, false)
+        result = source[selected]
+        dropColumns!(result, `selected)
+        reorderColumns!(result, ["time", "code"] join string(factors))
+        return result
+    }
+    """,
+    dependencies=(REQUIRE_TABLE_COLUMNS,),
+)
+
+PROJECT_FACTOR_OUTPUT = DolphinDBFunction(
+    module="query",
+    definition="""
+    def project_factor_output(source, names, start_time, end_time) {
+        // 按输出日期区间筛选最终结果，并严格按照 names 返回列。
+        columns = require_table_columns(source, names, "project_factor_output")
+        if (!("time" in columns)) {
+            throw "project_factor_output 的 names 必须包含 time"
+        }
+        selected = source.time >= start_time && source.time < end_time
+        result = source[selected]
+        extra = columnNames(result)[!(columnNames(result) in columns)]
+        if (size(extra) > 0) dropColumns!(result, extra)
+        reorderColumns!(result, columns)
+        return result
+    }
+    """,
+    dependencies=(REQUIRE_TABLE_COLUMNS,),
+)
+
+EVALUATE_DEFINITION = DolphinDBFunction(
+    module="query",
+    definition="""
+    def evaluate_definition(evaluator, source, definitions, mutable cache, mutable states, name) {
+        // 按名称递归计算因子，使用 cache 复用结果，并通过 states 检测循环依赖。
+        if (name in cache) return cache[name]
+        if (name in states && states[name] == 1) {
+            throw "命名因子存在循环依赖，重复进入 " + name
+        }
+        if (!(name in definitions)) throw "不存在命名因子 " + name
+
+        states[name] = 1
+        value = evaluator(source, definitions, cache, states, definitions[name])
+        value = require_vector(value, source.rows(), "命名因子 " + name)
+        cache[name] = value
+        states[name] = 2
+        return value
+    }
+    """
+)
+
+EVALUATE_OPERAND = DolphinDBFunction(
+    module="query",
+    definition="""
+    def evaluate_operand(evaluator, source, definitions, mutable cache, mutable states, operand) {
+        // 将操作数解析为嵌套 DSL、命名因子、输入列或原样返回的标量。
+        if (is_dictionary_form(operand)) {
+            result = evaluator(source, definitions, cache, states, operand)
+            if (is_vector_form(result) && size(result) == 1 && source.rows() != 1) {
+                return take(result, source.rows())
+            }
+            return result
+        }
+        if (is_scalar_form(operand) && type(operand) == STRING) {
+            if (operand in definitions) {
+                return evaluate_definition(evaluator, source, definitions, cache, states, operand)
+            }
+            if (operand in columnNames(source)) return source[operand]
+            throw "DSL 引用了不存在的列或命名因子 " + operand
+        }
+        if (is_scalar_form(operand)) return operand
+        throw "DSL 操作数必须是列名、命名因子、嵌套节点或标量，实际为 " + typestr(operand)
+    }
+    """,
+    dependencies=(IS_DICTIONARY_FORM, IS_SCALAR_FORM, IS_VECTOR_FORM),
+)
+
+EVALUATE_OPERANDS = DolphinDBFunction(
+    module="query",
+    definition="""
+    def evaluate_operands(evaluator, source, definitions, mutable cache, mutable states, operands) {
+        // 依次解析操作数列表，并以 ANY 数组保留不同结果类型。
+        result = array(ANY, 0)
+        for (operand in operands) {
+            result.append!(evaluate_operand(evaluator, source, definitions, cache, states, operand))
+        }
+        return result
+    }
+    """
+)
+
+EVALUATE_FIELDS = DolphinDBFunction(
+    module="query",
+    definition="""
+    def evaluate_fields(evaluator, source, definitions, mutable cache, mutable states, fields) {
+        // 解析 DSL fields 字典；向量字段按操作数列表处理，其余字段按单个操作数处理。
+        if (!is_dictionary_form(fields)) {
+            throw "DSL fields 必须是字典，实际类型为 " + typestr(fields)
+        }
+        result = dict(STRING, ANY)
+        for (name in string(fields.keys())) {
+            operand = fields[name]
+            if (is_vector_form(operand)) {
+                result[name] = evaluate_operands(evaluator, source, definitions, cache, states, operand)
+            } else {
+                result[name] = evaluate_operand(evaluator, source, definitions, cache, states, operand)
+            }
+        }
+        return result
+    }
+    """,
+    dependencies=(IS_DICTIONARY_FORM, IS_VECTOR_FORM),
+)
+
+EVALUATE_NODE = DolphinDBFunction(
+    module="query",
+    definition="""
+    def evaluate_node(source, definitions, mutable cache, mutable states, node) {
+        // 校验 DSL 节点公共结构，并按 DIRECT、TS 或 CS 分发到对应执行器。
+        node_type = require_key(node, "type", "DSL 节点")
+        require_key(node, "op", "DSL 节点")
+        require_key(node, "fields", "DSL 节点")
+        require_key(node, "params", "DSL 节点")
+        if (node_type == "DIRECT") {
+            if ("on" in node) throw "DIRECT 节点禁止包含 on"
+            return evaluate_direct(evaluate_node, source, definitions, cache, states, node)
+        }
+        if (node_type == "TS") {
+            return evaluate_time_series(evaluate_node, source, definitions, cache, states, node)
+        }
+        if (node_type == "CS") {
+            return evaluate_cross_section(evaluate_node, source, definitions, cache, states, node)
+        }
+        throw "未知 DSL 类型 " + string(node_type)
+    }
+    """
+)
+
+PARSE_DEFINITIONS = DolphinDBFunction(
+    module="query",
+    definition="""
+    def parse_definitions(definitions) {
+        // 接受标准 JSON 字符串或 ANY 字典，并规范化为命名因子定义集合。
+        result = definitions
+        if (is_scalar_form(result) && type(result) == STRING) result = fromStdJson(result)
+        if (!is_dictionary_form(result)) {
+            throw "派生因子集合必须是字典或标准 JSON 对象，实际为 " + typestr(result)
+        }
+        if (type(result) != ANY) {
+            throw "派生因子字典的值类型必须为 ANY，实际为 " + typestr(result)
+        }
+        return result
+    }
+    """,
+    dependencies=(IS_DICTIONARY_FORM, IS_SCALAR_FORM),
+)
+
+COMPUTE_FACTORS = DolphinDBFunction(
+    module="query",
+    definition="""
+    def compute_factors(source, definitions) {
+        // 计算全部命名因子并追加到 source 副本，同时拒绝因子名与输入列冲突。
+        if (!is_table_form(source)) {
+            throw "compute_factors 的 source 必须是 table，实际为 " + typestr(source)
+        }
+        parsed = parse_definitions(definitions)
+        names = string(parsed.keys())
+        conflicts = names[names in columnNames(source)]
+        if (size(conflicts) > 0) {
+            throw "命名因子与输入列重名：" + concat(conflicts, ", ")
+        }
+
+        cache = dict(STRING, ANY)
+        states = dict(STRING, INT)
+        result = select * from source
+        for (name in names) {
+            result[name] = evaluate_definition(evaluate_node, source, parsed, cache, states, name)
+        }
+        return result
+    }
+    """,
+    dependencies=(IS_TABLE_FORM,),
+)
+
+FILTER_FACTORS = DolphinDBFunction(
+    module="query",
+    definition="""
+    def filter_factors(source, filters) {
+        // 仅保留全部 filters 列都为 true 的行；NULL 视为 false。
+        if (!is_table_form(source)) {
+            throw "filter_factors 的 source 必须是 table，实际为 " + typestr(source)
+        }
+        if (!is_vector_form(filters)) {
+            throw "filter_factors 的 filters 必须是 STRING 向量，实际为 " + typestr(filters)
+        }
+        if (size(filters) == 0) return source
+        if (type(filters) != STRING) {
+            throw "filter_factors 的 filters 必须是 STRING 向量，实际为 " + typestr(filters)
+        }
+
+        names = string(filters)
+        missing = names[!(names in columnNames(source))]
+        if (size(missing) > 0) {
+            throw "filters 对应列不存在：" + concat(missing, ", ")
+        }
+
+        mask = take(true, source.rows())
+        for (name in names) {
+            values = source[name]
+            if (type(values) != BOOL) {
+                throw "filters 对应列必须为 BOOL 类型：" + name + "=" + typestr(values)
+            }
+            mask = mask && nullFill(values, false)
+        }
+        return source[mask]
+    }
+    """,
+    dependencies=(IS_TABLE_FORM, IS_VECTOR_FORM),
+)
+
+TOOL_FUNCTIONS = (
+    NORMALIZE_ON,
+    RESTORE_MASKED_ROWS,
+    SAMPLE_OPERANDS,
+    SELECT_OPERANDS,
+    APPLY_TIME_SERIES,
+    APPLY_CROSS_SECTION,
+    APPLY_GROUPED_CROSS_SECTION,
+    APPLY_CONTROLLED_CROSS_SECTION,
+    BUILD_CONTROL_TABLE,
+    REQUIRE_KEY,
+    REQUIRE_VECTOR,
+    REQUIRE_COLUMN,
+    FILL_OBSERVED_GROUP_NULL_COLUMN,
+    FILL_NULL_COLUMN,
+    FORWARD_FILL_COLUMN,
+    BUILD_FACTOR_SOURCE,
+    FINALIZE_FACTOR_SOURCE,
+    PROJECT_FACTOR_OUTPUT,
+)
+
+DERIVE_HELPER_FUNCTIONS = (
+    EVALUATE_DEFINITION,
+    EVALUATE_OPERAND,
+    EVALUATE_OPERANDS,
+    EVALUATE_FIELDS,
+)
+
+DERIVE_ENTRY_FUNCTIONS = (
+    EVALUATE_NODE,
+    PARSE_DEFINITIONS,
+    COMPUTE_FACTORS,
+    FILTER_FACTORS,
+)
