@@ -13,8 +13,6 @@ from query.utils import logger, validate_dolphindb_identifier
 
 from .compile.query.scripts import build_script
 
-COMPILED_QUERY = build_script()
-
 
 class LoguruSink(dolphindb.logger.Sink):
     def __init__(self) -> None:
@@ -37,11 +35,12 @@ def redirect_session_output(session: Any) -> None:
 def initialize_session(session: Any) -> None:
     """每个连接首次使用时执行本地编译的 DOS，不依赖服务端 query 模块。"""
     marker = "queryCompilation"
-    fingerprint = sha256(COMPILED_QUERY.encode("utf-8")).hexdigest()
+    script = build_script()
+    fingerprint = sha256(script.encode("utf-8")).hexdigest()
     exists = session.run(f"{json.dumps(marker)} in objs(true).name")
     if bool(exists) and session.run(marker) == fingerprint:
         return
-    session.run(COMPILED_QUERY)
+    session.run(script)
     session.upload({marker: fingerprint})
 
 
@@ -122,6 +121,7 @@ def create_session(
     """连接后立即加载 DOS；初始化失败关闭该连接并报错，不重放任务。"""
     if max_time is not None and (isinstance(max_time, bool) or not isinstance(max_time, int) or max_time <= 0):
         raise ValueError("max_time 必须是正整数秒数或 None")
+    build_script()
     selected = settings if settings is not None else DolphinSettings.from_env(role=role)
     failures = []
     for endpoint in selected.endpoints:

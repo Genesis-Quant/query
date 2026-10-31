@@ -66,11 +66,11 @@ def test_each_session_loads_compilation_once(monkeypatch):
     session.upload.side_effect = state.update
     sessions.initialize_session(session)
     sessions.initialize_session(session)
-    assert sum(call.args[0] == sessions.COMPILED_QUERY for call in session.run.call_args_list) == 1
+    assert sum(call.args[0] == sessions.build_script() for call in session.run.call_args_list) == 1
     other = Mock()
     other.run.return_value = None
     sessions.initialize_session(other)
-    assert sum(call.args[0] == sessions.COMPILED_QUERY for call in other.run.call_args_list) == 1
+    assert sum(call.args[0] == sessions.build_script() for call in other.run.call_args_list) == 1
 
 
 def test_connect_preloads_before_return_and_initialization_failure_closes(monkeypatch):
@@ -79,7 +79,7 @@ def test_connect_preloads_before_return_and_initialization_failure_closes(monkey
     monkeypatch.setattr(sessions.dolphindb, "session", lambda: connection)
     monkeypatch.setattr(sessions, "redirect_session_output", lambda _: None)
     assert sessions.create_session(settings()) is connection
-    connection.run.assert_any_call(sessions.COMPILED_QUERY)
+    connection.run.assert_any_call(sessions.build_script())
     connection.close.assert_not_called()
     connection.run.side_effect = RuntimeError("compile failure")
     with pytest.raises(RuntimeError, match="compile failure"):
@@ -96,7 +96,7 @@ def test_endpoint_failure_closes_before_trying_next(monkeypatch):
     monkeypatch.setattr(sessions, "redirect_session_output", lambda _: None)
     assert sessions.create_session(settings(endpoints=("first:8848", "second:8848"))) is second
     first.close.assert_called_once()
-    second.run.assert_any_call(sessions.COMPILED_QUERY)
+    second.run.assert_any_call(sessions.build_script())
 
 
 def test_lookforward_expands_only_calculation_domain_and_accepts_custom_factors():

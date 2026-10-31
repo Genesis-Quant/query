@@ -319,17 +319,16 @@ EMPTY_FACTOR_TIMELINE = DolphinDBFunction(
     """
 )
 
-BUILD_FACTOR_SOURCE = DolphinDBFunction(
+BUILD_DEFAULT_FACTOR_SOURCE = DolphinDBFunction(
     module="query",
     definition="""
-    def build_factor_source(
+    def build_default_factor_source(
             data,
             codes,
             factors,
             dates,
             start_time,
-            end_time,
-            seed_factors) {
+            end_time) {
         // 从统一长表完成筛选、交易日展开、事件时间线构造和长转宽。
         if (!is_table_form(data)) {
             throw "build_factor_source 的 data 必须是 table，实际为 " + typestr(data)
@@ -342,19 +341,6 @@ BUILD_FACTOR_SOURCE = DolphinDBFunction(
         }
         if (!is_vector_form(dates)) {
             throw "build_factor_source 的 dates 必须是时间向量"
-        }
-        if (!is_vector_form(seed_factors)) {
-            throw "build_factor_source 的 seed_factors 必须是 STRING 向量"
-        }
-        if (size(seed_factors) > 0 && type(seed_factors) != STRING) {
-            throw "build_factor_source 的 seed_factors 必须是 STRING 向量"
-        }
-        invalid_seed_factors = string(seed_factors)[
-            !(string(seed_factors) in string(factors))
-        ]
-        if (size(invalid_seed_factors) > 0) {
-            throw "seed_factors 不在 factors 中：" +
-                concat(invalid_seed_factors, ", ")
         }
         if (size(dates) == 0) return empty_factor_timeline(factors)
 
@@ -371,26 +357,6 @@ BUILD_FACTOR_SOURCE = DolphinDBFunction(
               and time < end_time
               and factor in symbol(factors)
               and code in symbol(codes)
-        if (size(seed_factors) > 0) {
-            historical = select timestamp(time) as time, code, factor, value
-                from data
-                where time < start_time
-                  and factor in symbol(seed_factors)
-                  and code in symbol(codes)
-                order by code, factor, time
-            latest = select
-                    last(time) as seed_time,
-                    last(value) as seed_value
-                from historical
-                group by code, factor
-            seeds = select
-                    seed_time as time,
-                    code,
-                    factor,
-                    seed_value as value
-                from latest
-            values = unionAll(values, seeds)
-        }
         events = select time, code, false as selected from values
         timeline = select max(selected) as selected
             from unionAll(universe, events)
@@ -418,6 +384,134 @@ BUILD_FACTOR_SOURCE = DolphinDBFunction(
     dependencies=(
         EMPTY_FACTOR_TIMELINE,
         IS_TABLE_FORM,
+        IS_VECTOR_FORM,
+    ),
+)
+
+BUILD_FIXED_CODE_FACTOR_SOURCE = DolphinDBFunction(
+    module="query",
+    definition="""
+    def build_fixed_code_factor_source(
+            data,
+            names,
+            target_codes,
+            target_factors,
+            times,
+            start_time,
+            end_time) {
+        // 在外部证券自己的时间线上按基础字段默认填充，再对齐原面板；不添加证券行。
+        financial_factors = __FINANCIAL_FACTORS__
+        industry_factors = __INDUSTRY_FACTORS__
+        result = dict(STRING, ANY)
+        for (target_code in distinct(target_codes)) {
+            matched = target_codes == target_code
+            base_factors = target_factors[matched]
+            aliases = names[matched]
+            reference_data = select
+                    timestamp(date(time)) as time, code, factor, value
+                from data
+                where time >= start_time, time < end_time,
+                      code = symbol([target_code])[0],
+                      factor in symbol(base_factors)
+            duplicates = select count(*) as copies from reference_data group by time, factor
+            if (any(duplicates.copies > 1)) {
+                throw "factor@code 每个日期只能有一条记录：" + target_code
+            }
+            timeline = sort(distinct(timestamp(times)))
+            for (column in base_factors[startsWith(base_factors, "weight_")]) {
+                observed = exec distinct timestamp(date(time)) from data
+                    where factor = symbol([column])[0], time >= start_time, time < end_time
+                timeline = sort(distinct(timeline join observed))
+            }
+            reference = build_default_factor_source(
+                reference_data, [target_code], base_factors, timeline,
+                start_time, end_time
+            )
+            for (i in 0 .. (size(base_factors) - 1)) {
+                column = base_factors[i]
+                if (column == "is_st") {
+                    reference = fill_null_column(reference, column, 0.0)
+                } else if (startsWith(column, "weight_")) {
+                    observed = exec distinct timestamp(date(time)) from data
+                        where factor = symbol([column])[0], time >= start_time, time < end_time
+                    reference[column] = iif(
+                        reference.time in observed,
+                        nullFill(reference[column], 0.0), reference[column]
+                    )
+                    reference = forward_fill_column(
+                        reference, column, reference.code, reference.time
+                    )
+                } else if (column in financial_factors || column in industry_factors) {
+                    reference = forward_fill_column(
+                        reference, column, reference.code, reference.time
+                    )
+                }
+                mapping = dict(timestamp(reference.time), double(reference[column]))
+                result[aliases[i]] = mapping[timestamp(times)]
+            }
+        }
+        return result
+    }
+    """,
+    dependencies=(BUILD_DEFAULT_FACTOR_SOURCE, FILL_NULL_COLUMN, FORWARD_FILL_COLUMN),
+)
+
+BUILD_FACTOR_SOURCE = DolphinDBFunction(
+    module="query",
+    definition="""
+    def build_factor_source(
+            data,
+            codes,
+            factors,
+            dates,
+            start_time,
+            end_time) {
+        if (!is_vector_form(factors) || (size(factors) > 0 && type(factors) != STRING)) {
+            throw "build_factor_source 的 factors 必须是 STRING 向量"
+        }
+        if (size(distinct(factors)) != size(factors)) throw "factors 不能重复"
+        defaults = array(STRING, 0)
+        references = array(STRING, 0)
+        reference_codes = array(STRING, 0)
+        reference_factors = array(STRING, 0)
+        for (name in string(factors)) {
+            // 类型分发只在这里扩展；普通字段与固定证券引用各自独立构造。
+            kind = iif(strReplace(name, "@", "") == name, "default", "fixed_code")
+            if (kind == "default") {
+                defaults.append!(name)
+            } else if (kind == "fixed_code") {
+                parts = split(name, "@")
+                if (size(parts) != 2) throw "因子引用必须为 factor@code：" + name
+                if (strlen(trim(parts[0])) == 0 || strlen(trim(parts[1])) == 0 ||
+                    parts[0] != trim(parts[0]) || parts[1] != trim(parts[1])) {
+                    throw "factor@code 的字段和代码不能为空或包含首尾空格：" + name
+                }
+                references.append!(name)
+                reference_factors.append!(parts[0])
+                reference_codes.append!(parts[1])
+            } else {
+                throw "不支持的因子引用类型：" + kind
+            }
+        }
+        result = build_default_factor_source(
+            data, codes, defaults, dates, start_time, end_time
+        )
+        if (result.rows() == 0) return empty_factor_timeline(factors)
+        if (size(references) > 0) {
+            fixed = build_fixed_code_factor_source(
+                data, references, reference_codes, reference_factors,
+                result.time, start_time, end_time
+            )
+            for (name in references) result[name] = fixed[name]
+        }
+        reorderColumns!(result, ["time", "code", "selected"] join string(factors))
+        return result
+    }
+    """,
+    dependencies=(
+        BUILD_DEFAULT_FACTOR_SOURCE,
+        BUILD_FIXED_CODE_FACTOR_SOURCE,
+        EMPTY_FACTOR_TIMELINE,
         IS_VECTOR_FORM,
     ),
 )

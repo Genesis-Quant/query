@@ -1,5 +1,6 @@
 """启动时编译无服务器模块依赖的 query 会话脚本。"""
 
+import json
 from functools import cache
 from pathlib import Path
 
@@ -28,8 +29,7 @@ def buildQuery(request) {
         request.factors,
         timeline,
         request.start,
-        request.end,
-        request.industry
+        request.end
     )
     source[`selected] = source.time in calendar
 
@@ -45,15 +45,6 @@ def buildQuery(request) {
                 source[column]
             )
             source = forward_fill_column(source, column, source.code, source.time)
-            snapshotDate = exec max(time) from sourceTable
-                where factor = symbol([column])[0], time < request.start
-            if (!isNull(snapshotDate)) {
-                snapshot = select first(value) as weight from sourceTable
-                    where factor = symbol([column])[0], time = snapshotDate
-                    group by code
-                prior = dict(string(snapshot.code), double(snapshot.weight))[string(source.code)]
-                source[column] = iif(isNull(source[column]), nullFill(prior, 0.0), source[column])
-            }
         } else if (column in request.financial || column in request.industry) {
             source = forward_fill_column(source, column, source.code, source.time)
         }
@@ -71,7 +62,13 @@ def buildQuery(request) {
 @cache
 def build_script() -> str:
     """一次编译全部查询函数及 common 依赖，供每个 session 预加载。"""
-    return compile_script("query", QUERY_FUNCTIONS, uses=("ta",)) + "\n" + QUERY_SCRIPT
+    from query.workers.industry import INDUSTRY_FACTORS
+    from query.workers.stock_financial import FINANCIAL_FACTORS
+
+    script = compile_script("query", QUERY_FUNCTIONS, uses=("ta",)) + "\n" + QUERY_SCRIPT
+    return script.replace("__FINANCIAL_FACTORS__", json.dumps(sorted(FINANCIAL_FACTORS))).replace(
+        "__INDUSTRY_FACTORS__", json.dumps(list(INDUSTRY_FACTORS))
+    )
 
 
 def write_script(*, output_dir: Path = Path("output")) -> Path:
