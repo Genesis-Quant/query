@@ -265,6 +265,10 @@ EVALUATE_TIME_SERIES = DolphinDBFunction(
             specification["window"] = int(params["window"])
             specification["minimum"] = rolling_min_periods(params["window"], int(params["min_periods"]))
             specification["intercept"] = params["intercept"]
+            fill_config = dict(STRING, ANY)
+            fill_config["rule"] = "ffill"
+            if ("fill" in params) fill_config["rule"] = params["fill"]
+            specification["fill"] = normalize_regression_fill(fill_config["rule"], size(fields["controls"]))
             specification["on"] = NULL
             if ("on" in node) specification["on"] = node["on"]
             cache_key = "_query_rolling_ols_" + toStdJson(specification)
@@ -281,7 +285,7 @@ EVALUATE_TIME_SERIES = DolphinDBFunction(
                 controls = build_control_table(control_values)
                 cache[cache_key] = apply_rolling_ols(
                     target, controls, on, code, time,
-                    params["window"], int(params["min_periods"]), params["intercept"]
+                    params["window"], int(params["min_periods"]), params["intercept"], specification["fill"]
                 )
             }
             coefficients = cache[cache_key]

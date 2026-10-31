@@ -2,7 +2,7 @@
 
 from query.database.compile import DolphinDBFunction
 
-from .form import IS_SCALAR_FORM, IS_TABLE_FORM, IS_VECTOR_FORM
+from .form import IS_DICTIONARY_FORM, IS_SCALAR_FORM, IS_TABLE_FORM, IS_VECTOR_FORM
 
 IS_FINITE_NUMBER = DolphinDBFunction(
     module="common",
@@ -281,6 +281,222 @@ ROLLING_INTERCEPT = DolphinDBFunction(
     dependencies=(ROLLING_SLOPE,),
 )
 
+NORMALIZE_REGRESSION_FILL = DolphinDBFunction(
+    module="common",
+    definition=r"""
+    def normalize_regression_fill(fill, count) {
+        /*
+        规范化内部填充配置，不登记为算符；调用方省略参数时传入 "ffill"。
+
+        Parameters
+        ----------
+        fill : string, dictionary or NULL
+            NULL 关闭全部填充；ffill/mean 或 method 规则应用所有列；
+            target/controls 对象分别配置，省略项默认 ffill；也接受内部规范化结果。
+        count : int
+            有序解释变量数量，不包含目标；controls 列表必须与它等长。
+
+        Returns
+        -------
+        config : dictionary
+            methods 为目标加有序控制的 STRING 向量，空字符串表示该列不填；
+            values 为对应常量的 ANY 列表，非 constant 的项统一为 VOID NULL。
+
+        Notes
+        -----
+        列表内 NULL 表示该列不填。常量必须显式指定且非 NULL；不支持未来回填。
+        同义配置归一后用于共享拟合缓存，不同方法或常量不得共享错误的结果。
+        不读取行情、不猜测股票池，不将 fill 名称解释为列引用。
+
+        Examples
+        --------
+        >>> normalize_regression_fill("ffill", 1).methods
+        ["ffill", "ffill"]
+        >>> normalize_regression_fill(NULL, 1).methods
+        ["", ""]
+        >>> normalize_regression_fill(fromStdJson('{"target":null,"controls":["mean"]}'), 1).methods
+        ["", "mean"]
+        */
+        if (is_dictionary_form(fill) && "methods" in fill && "values" in fill) {
+            if (size(fill.methods) != count + 1 || size(fill.values) != count + 1)
+                throw "规范化 fill 必须与目标和解释变量等长"
+            return fill
+        }
+        rules = array(ANY, 0)
+        for (i in 0 : (count + 1)) rules.append!(fill)
+        if (is_dictionary_form(fill) && !("method" in fill)) {
+            rules = array(ANY, 0)
+            for (i in 0 : (count + 1)) rules.append!("ffill")
+            if ("target" in fill) rules[0] = fill["target"]
+            if ("controls" in fill && type(fill["controls"]) != VOID) {
+                controls_fill = fill["controls"]
+                if (!is_vector_form(controls_fill) || size(controls_fill) != count)
+                    throw "fill.controls 必须与回归解释变量等长"
+                for (i in 0 : count) rules[i + 1] = controls_fill[i]
+            }
+        }
+        methods = take("", count + 1)
+        values = array(ANY, 0)
+        for (i in 0 : (count + 1)) {
+            rule = rules[i]
+            method = ""
+            if (type(rule) != VOID) {
+                if (is_dictionary_form(rule)) {
+                    if (!("method" in rule)) throw "fill 单列规则缺少 method"
+                    method = rule["method"]
+                } else if (is_scalar_form(rule) && type(rule) == STRING) method = rule
+                else throw "fill 必须为 NULL、ffill、mean、constant 规则或逐列配置"
+                if (!(method in ["constant", "ffill", "mean"])) throw "不支持的回归 fill 方法"
+                if (method == "constant") {
+                    if (!is_dictionary_form(rule)) throw "constant 填充必须提供非 NULL 的 value"
+                    if (!("value" in rule)) throw "constant 填充必须提供非 NULL 的 value"
+                    if (isNull(rule["value"])) throw "constant 填充必须提供非 NULL 的 value"
+                } else if (is_dictionary_form(rule)) {
+                    if ("value" in rule) {
+                        if (!isNull(rule["value"])) throw "只有 constant 填充允许指定 value"
+                    }
+                }
+            }
+            methods[i] = method
+            if (method == "constant") values.append!(rule["value"])
+            else values.append!(NULL)
+        }
+        return dict(`methods`values, [methods, values])
+    }
+    """,
+    dependencies=(IS_DICTIONARY_FORM, IS_SCALAR_FORM, IS_VECTOR_FORM),
+)
+
+FILL_REGRESSION_COLUMN = DolphinDBFunction(
+    module="common",
+    definition=r"""
+    def fill_regression_column(col, method, value, code, time, target) {
+        /*
+        内部单列填充，在确定窗口前处理当前节点的参与行，不改变外层列。
+
+        Parameters
+        ----------
+        col : vector
+            数值目标或连续/BOOL/STRING/SYMBOL 控制；行数与 code/time 一致。
+        method : string
+            空字符串不填；constant 用 value，ffill 沿各股票已加载历史，mean 用同日截面。
+        value : scalar or NULL
+            constant 的同类型常量；数值可用整数或浮点，但不把分类转成连续值。
+        code, time : vector
+            当前节点 on=true 的参与行；ffill 按证券、日期，mean 只使用相同日期。
+        target : bool
+            true 时 col 必须为数值目标，BOOL 不当作连续目标。
+
+        Returns
+        -------
+        result : vector
+            数值列转为 DOUBLE；分类列保持类型。None 不填且保持原值；其它方法先将
+            数值 NULL/NaN/Inf 视作缺失。ffill 头部、mean 整个截面无有效值时仍为 NULL。
+
+        Notes
+        -----
+        mean 不跨日期、不跨字段，只使用本列该日原始有限数值，不做递归填补；
+        BOOL/STRING/SYMBOL 的 mean 明确报错。ffill 不使用未来数据或区间外 seed。
+        填充值会参与 min_periods 和当天残差，不是只填输出，也不填已算出的残差。
+
+        Examples
+        --------
+        >>> fill_regression_column(1.0 NULL 3 NULL, "ffill", NULL, `A`A`B`B, 1 2 1 2, true)
+        [1, 1, 3, 3]
+        >>> fill_regression_column(1.0 NULL 3 NULL, "mean", NULL, `A`B`A`B, 1 1 2 2, true)
+        [1, 1, 3, 3]
+        >>> fill_regression_column(1.0 NULL, "constant", 0.0, `A`A, 1 2, true)
+        [1, 0]
+        */
+        numeric = type(col) in [CHAR, SHORT, INT, LONG, FLOAT, DOUBLE]
+        categorical = type(col) in [BOOL, SYMBOL, STRING]
+        if (target && !numeric) throw "回归 target 必须是数值"
+        if (!numeric && !categorical) throw "回归解释变量必须是数值或 BOOL/STRING/SYMBOL"
+        if (method == "") return col
+        values = col.copy()
+        if (numeric) values = iif(is_finite_number(col), double(col), double(NULL))
+        if (method == "constant") {
+            if (numeric) {
+                if (!(type(value) in [CHAR, SHORT, INT, LONG, FLOAT, DOUBLE]) || !is_finite_number(value))
+                    throw "数值回归列的 constant 必须是有限数值且不能是 BOOL"
+                return nullFill(values, double(value))
+            }
+            if (type(col) == BOOL) {
+                if (type(value) != BOOL) throw "BOOL 控制列的 constant 必须是 BOOL"
+                return nullFill(values, value)
+            }
+            if (!(type(value) in [STRING, SYMBOL])) throw "STRING/SYMBOL 控制列的 constant 必须是字符串类别"
+            result = nullFill(string(values), string(value))
+            if (type(col) == SYMBOL) return symbol(result)
+            return result
+        }
+        if (method == "mean" && !numeric) throw "mean 截面均值填充不支持分类控制变量"
+        if (size(col) == 0) return values
+        if (method == "ffill") return contextby(ffill, values, code, time)
+        if (method == "mean") {
+            means = contextby(avg, values, time)
+            return iif(isNull(values), means, values)
+        }
+        throw "不支持的回归 fill 方法"
+    }
+    """,
+    dependencies=(IS_FINITE_NUMBER,),
+)
+
+FILL_REGRESSION_INPUTS = DolphinDBFunction(
+    module="common",
+    definition=r"""
+    def fill_regression_inputs(target, controls, code, time, fill) {
+        /*
+        内部统一预填充，供面板批处理及公开单序列算符共用。
+
+        Parameters
+        ----------
+        target : vector[NUMBER]
+            原始数值目标；与 controls、code、time 等行数。
+        controls : table
+            有序的连续或分类控制列，不接受空解释变量表。
+        code, time : vector
+            当前节点参与行的证券和日期；调用方先应用 on 并保留原行位置。
+        fill : string, dictionary or NULL
+            ffill、mean、constant 规则或逐列配置；NULL 明确关闭，省略列默认 ffill。
+
+        Returns
+        -------
+        filled : dictionary
+            target 为填充目标向量，controls 为保持列顺序/分类类型的控制表。
+            返回值与原参与行等长，不删除行，也不改变调用方的输入表或向量。
+
+        Notes
+        -----
+        每列独立填充后再由回归计算共同有效掩码；不依赖其它列是否缺失。
+        不缩短日期轴、不补区间外历史、不用未来数据，填充值正常计入 min_periods。
+        公开单序列调用没有其他股票，mean 因而无法填补该日期唯一观测的缺失。
+
+        Examples
+        --------
+        >>> fill_regression_inputs(1.0 NULL 3, table(1.0 2 NULL as x), take("A", 3), 1..3, "ffill").target
+        [1, 1, 3]
+        >>> fill_regression_inputs(1.0 NULL 3, table(1.0 2 NULL as x), take("A", 3), 1..3, "ffill").controls.x
+        [1, 2, 2]
+        */
+        n = size(target)
+        if (!is_vector_form(target) || !is_table_form(controls) || controls.rows() != n || controls.cols() == 0)
+            throw "回归 target 和 controls 必须等长且解释变量非空"
+        config = normalize_regression_fill(fill, controls.cols())
+        filled_target = fill_regression_column(target, config.methods[0], config.values[0], code, time, true)
+        filled_controls = controls.copy()
+        names = controls.columnNames()
+        for (i in 0 : size(names)) {
+            values = fill_regression_column(controls[names[i]], config.methods[i + 1], config.values[i + 1], code, time, false)
+            replaceColumn!(filled_controls, symbol([names[i]])[0], values)
+        }
+        return dict(`target`controls, [filled_target, filled_controls])
+    }
+    """,
+    dependencies=(NORMALIZE_REGRESSION_FILL, FILL_REGRESSION_COLUMN, IS_TABLE_FORM, IS_VECTOR_FORM),
+)
+
 ROLLING_CONTROLS_REGRESSION = DolphinDBFunction(
     module="common",
     definition=r"""
@@ -347,6 +563,97 @@ ROLLING_CONTROLS_REGRESSION = DolphinDBFunction(
     }
     """,
     dependencies=(ROLLING_MIN_PERIODS, CONTROLS_REGRESSION, IS_TABLE_FORM, IS_VECTOR_FORM),
+)
+
+CONTROLS_REGRESSION_BATCH = DolphinDBFunction(
+    module="common",
+    definition=r"""
+    def controls_regression_batch(targets, controls, intercept, current_valid) {
+        /*
+        内部多目标回归辅助函数；只接收共同有效行和设计矩阵完全相同的一组目标。
+
+        Parameters
+        ----------
+        targets : matrix[DOUBLE]
+            行为共同有效观测，列为各股票目标；调用方已排除 NULL、NaN、Inf。
+        controls : table
+            与 targets 等行数的有序原始控制列；连续和分类编码规则同 controls_regression。
+        intercept : bool
+            正常拟合是否包含截距；无活动控制或小样本仍沿用去均值退化。
+        current_valid : bool
+            原窗口末行是否共同有效；false 时只返回系数，当天残差保持 NULL。
+
+        Returns
+        -------
+        fit : dictionary
+            alpha/residual 是按目标列排列的向量，beta 是展开控制列 × 目标列的矩阵。
+            names 保留数值常量列位置；分类只使用本组当前窗口有效行并按升序删首类。
+
+        Notes
+        -----
+        不合并不同有效掩码，不取全市场共同样本，不使用未来类别，不输出矩阵因子。
+        每组只分解一次设计矩阵，pinv(X) ** targets 等价于各目标分别求最小范数解。
+        当前行缺失时不把最后一个有效历史观测的残差冒充当天残差。
+        无活动控制列、单样本或样本数不大于控制列数加截距项时，alpha 为各目标均值、
+        beta 为 0；该退化规则也适用于 intercept=false。矩阵乘法可能有浮点舍入差异。
+
+        Examples
+        --------
+        >>> controls_regression_batch(matrix(1.0 3 5 7, 2.0 5 8 11), table(0.0 1 2 3 as x), true, true).alpha
+        [1, 2]
+        >>> controls_regression_batch(matrix(1.0 3 5 7, 2.0 5 8 11), table(0.0 1 2 3 as x), true, true).beta
+        [[2, 3]]
+        >>> controls_regression_batch(matrix(1.0 3 5 7, 2.0 5 8 11), table(0.0 1 2 3 as x), true, false).residual
+        [NULL, NULL]
+        */
+        n = targets.rows()
+        count = targets.cols()
+        names = array(STRING, 0)
+        categories = array(STRING, 0)
+        for (name in controls.columnNames()) {
+            if (type(controls[name]) in [BOOL, SYMBOL, STRING]) {
+                categories.append!(name)
+                levels = sort(distinct(controls[name]))
+                if (size(levels) > 1) {
+                    for (j in 1 .. (size(levels) - 1))
+                        names.append!(name + "_" + string(levels[j]))
+                }
+            } else names.append!(name)
+        }
+        encoded = controls
+        if (size(categories) > 0) encoded = oneHot(controls, symbol(categories))
+        active = array(STRING, 0)
+        for (name in names) {
+            if (!(name in encoded.columnNames())) throw "回归分类编码列不存在：" + name
+            if (size(distinct(encoded[name])) > 1) active.append!(name)
+        }
+        beta = matrix(DOUBLE, size(names), count, count, 0.0)
+        alpha = avg(targets)
+        residual = flatten(targets[n - 1,]) - alpha
+        if (size(active) > 0 && n > 1 && n > size(active) + int(intercept)) {
+            design = array(ANY, 0)
+            if (intercept) design.append!(take(1.0, n))
+            for (name in active) design.append!(double(encoded[name]))
+            coefficients = pinv(matrix(design)) ** targets
+            alpha = take(0.0, count)
+            if (intercept) alpha = flatten(coefficients[0,])
+            fitted = alpha.copy()
+            for (j in 0 .. (size(active) - 1)) {
+                position = find(names, active[j])
+                beta[position,] = coefficients[j + int(intercept),]
+                fitted += flatten(coefficients[j + int(intercept),]) * double(last(encoded[active[j]]))
+            }
+            residual = flatten(targets[n - 1,]) - fitted
+        }
+        if (!current_valid) residual = take(double(NULL), count)
+        fit = dict(STRING, ANY)
+        fit["alpha"] = alpha
+        fit["beta"] = beta
+        fit["residual"] = residual
+        fit["names"] = names
+        return fit
+    }
+    """,
 )
 
 ROLLING_TRUE_COUNT = DolphinDBFunction(

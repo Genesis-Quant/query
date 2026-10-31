@@ -3,6 +3,7 @@
 from query.database.compile import DolphinDBFunction
 from query.database.compile.common.functions import (
     DIVIDE_OR_NULL,
+    FILL_REGRESSION_INPUTS,
     MASK_EXPANDING_RESULT,
     MASK_PAIR_EXPANDING_RESULT,
     ROLLING_CONTROLS_REGRESSION,
@@ -16,7 +17,7 @@ from query.database.compile.common.functions import (
 TS_CONTROLS_ROLLING_ALPHA = DolphinDBFunction(
     module="query",
     definition=r"""
-    def ts_controls_rolling_alpha(target, controls, window, min_periods, intercept) {
+    def ts_controls_rolling_alpha(target, controls, window, min_periods, intercept, fill="ffill") {
         /*
         在右对齐多元滚动 OLS 中返回截距；函数独立接收原始目标和控制变量。
 
@@ -32,6 +33,10 @@ TS_CONTROLS_ROLLING_ALPHA = DolphinDBFunction(
             最少共同有效样本，NULL 默认 window；缺失观测不跳位置。
         intercept : bool
             正常拟合是否含截距；退化窗口沿用 CS 的去均值规则。
+        fill : string, dictionary or NULL, default "ffill"
+            NULL 不填；ffill 在已加载单序列内前向填充，constant 规则给出 value；
+            mean 是同日截面均值，单序列每行视为独立日期，不能从其他股票取值。
+            支持 target/controls 逐列配置，未配置列默认 ffill；分类列不支持 mean。
 
         Returns
         -------
@@ -40,10 +45,12 @@ TS_CONTROLS_ROLLING_ALPHA = DolphinDBFunction(
 
         Notes
         -----
-        目标、全部控制共同排除 NULL/非有限输入，分类基准仅取当前窗口的有效类别。
+        先填输入再确定共同有效样本，填充后仍缺失的行排除；分类基准只取当前窗口。
+        数值 NULL/NaN/Inf 视为缺失，ffill 不补区间头部、不使用区间外 seed 或未来值。
+        填补后的观测计入 min_periods，不能凭空补足预热行数，也不填回归后的输出。
         alpha/beta 不代表整个窗口残差波动率；rolling_residual 只返回当前行残差。
         正常回归 intercept=false 时为 0；无有效控制列或小样本退化时为有效 target 均值。
-        当前行缺失不影响此前有效样本参与拟合，达到 min_periods 仍可输出截距。
+        当前行填充后仍缺失不影响此前样本参与拟合，达到 min_periods 仍可输出截距。
 
         Examples
         --------
@@ -52,16 +59,24 @@ TS_CONTROLS_ROLLING_ALPHA = DolphinDBFunction(
         >>> ts_controls_rolling_alpha(1.0 2 4 8, table(take(1.0, 4) as constant), 2, 2, false)
         [NULL, 1.5, 3, 6]
         */
-        return rolling_controls_regression(target, controls, window, min_periods, intercept).alpha
+        input_target = target
+        input_controls = controls
+        if (type(fill) != VOID && size(target) > 0) {
+            n = size(target)
+            filled = fill_regression_inputs(target, controls, take("sequence", n), long(0 .. (n - 1)), fill)
+            input_target = filled.target
+            input_controls = filled.controls
+        }
+        return rolling_controls_regression(input_target, input_controls, window, min_periods, intercept).alpha
     }
     """,
-    dependencies=(ROLLING_CONTROLS_REGRESSION,),
+    dependencies=(ROLLING_CONTROLS_REGRESSION, FILL_REGRESSION_INPUTS),
 )
 
 TS_CONTROLS_ROLLING_BETA = DolphinDBFunction(
     module="query",
     definition=r"""
-    def ts_controls_rolling_beta(target, controls, window, min_periods, intercept, index) {
+    def ts_controls_rolling_beta(target, controls, window, min_periods, intercept, index, fill="ffill") {
         /*
         在右对齐多元滚动 OLS 中返回指定解释变量系数；函数独立接收原始目标和控制变量。
 
@@ -79,6 +94,10 @@ TS_CONTROLS_ROLLING_BETA = DolphinDBFunction(
             正常拟合是否含截距；退化窗口沿用 CS 的去均值规则。
         index : int
             0 起算的当前窗口展开列位置，不包含截距；不存在时返回 NULL。
+        fill : string, dictionary or NULL, default "ffill"
+            NULL 不填；ffill 在已加载单序列内前向填充，constant 规则给出 value；
+            mean 是同日截面均值，单序列每行视为独立日期，不能从其他股票取值。
+            支持 target/controls 逐列配置，未配置列默认 ffill；分类列不支持 mean。
 
         Returns
         -------
@@ -87,7 +106,9 @@ TS_CONTROLS_ROLLING_BETA = DolphinDBFunction(
 
         Notes
         -----
-        目标、全部控制共同排除 NULL/非有限输入，分类基准仅取当前窗口的有效类别。
+        先填输入再确定共同有效样本，填充后仍缺失的行排除；分类基准只取当前窗口。
+        数值 NULL/NaN/Inf 视为缺失，ffill 不补区间头部、不使用区间外 seed 或未来值。
+        填补后的观测计入 min_periods，不能凭空补足预热行数，也不填回归后的输出。
         alpha/beta 不代表整个窗口残差波动率；rolling_residual 只返回当前行残差。
         展开顺序先按 controls 列顺序，再按每列当前窗口有效类别升序删首类。
         数值常量列保留位置且系数为 0，分类只有一类时不占展开位置。
@@ -101,19 +122,27 @@ TS_CONTROLS_ROLLING_BETA = DolphinDBFunction(
         [NULL, NULL, NULL, NULL]
         */
         if (isNull(index) || index < 0 || index != int(index)) throw "回归系数 index 必须是非负整数"
-        coefficients = rolling_controls_regression(target, controls, window, min_periods, intercept)
+        input_target = target
+        input_controls = controls
+        if (type(fill) != VOID && size(target) > 0) {
+            n = size(target)
+            filled = fill_regression_inputs(target, controls, take("sequence", n), long(0 .. (n - 1)), fill)
+            input_target = filled.target
+            input_controls = filled.controls
+        }
+        coefficients = rolling_controls_regression(input_target, input_controls, window, min_periods, intercept)
         name = "beta" + string(int(index))
         if (!(name in coefficients.columnNames())) return take(double(NULL), size(target))
         return coefficients[name]
     }
     """,
-    dependencies=(ROLLING_CONTROLS_REGRESSION,),
+    dependencies=(ROLLING_CONTROLS_REGRESSION, FILL_REGRESSION_INPUTS),
 )
 
 TS_CONTROLS_ROLLING_RESIDUAL = DolphinDBFunction(
     module="query",
     definition=r"""
-    def ts_controls_rolling_residual(target, controls, window, min_periods, intercept) {
+    def ts_controls_rolling_residual(target, controls, window, min_periods, intercept, fill="ffill") {
         /*
         在右对齐多元滚动 OLS 中返回当前观测残差；函数独立接收原始目标和控制变量。
 
@@ -129,6 +158,10 @@ TS_CONTROLS_ROLLING_RESIDUAL = DolphinDBFunction(
             最少共同有效样本，NULL 默认 window；缺失观测不跳位置。
         intercept : bool
             正常拟合是否含截距；退化窗口沿用 CS 的去均值规则。
+        fill : string, dictionary or NULL, default "ffill"
+            NULL 不填；ffill 在已加载单序列内前向填充，constant 规则给出 value；
+            mean 是同日截面均值，单序列每行视为独立日期，不能从其他股票取值。
+            支持 target/controls 逐列配置，未配置列默认 ffill；分类列不支持 mean。
 
         Returns
         -------
@@ -137,9 +170,12 @@ TS_CONTROLS_ROLLING_RESIDUAL = DolphinDBFunction(
 
         Notes
         -----
-        目标、全部控制共同排除 NULL/非有限输入，分类基准仅取当前窗口的有效类别。
+        先填输入再确定共同有效样本，填充后仍缺失的行排除；分类基准只取当前窗口。
+        数值 NULL/NaN/Inf 视为缺失，ffill 不补区间头部、不使用区间外 seed 或未来值。
+        填补后的观测计入 min_periods，不能凭空补足预热行数，也不填回归后的输出。
         alpha/beta 不代表整个窗口残差波动率；rolling_residual 只返回当前行残差。
-        当前目标或任一控制缺失时，当天残差为 NULL；不能以前一天残差填补。
+        当前目标或任一控制填补后仍缺失时，当天残差为 NULL；不能以前一天残差填补。
+        当前输入填充成功则按填充值计算当天 residual；这是填充输入的残差而非真实观测。
         窗口无有效控制或样本不足时沿用去均值退化，当天输出 y_t-avg(y)。
         后续 rolling_std/rolling_mean 统计的是逐日各自拟合的残差序列，
         不是把当天系数应用于当前窗口全部历史观测后重新计算的同窗残差统计。
@@ -151,10 +187,18 @@ TS_CONTROLS_ROLLING_RESIDUAL = DolphinDBFunction(
         >>> ts_controls_rolling_residual(1.0 2 4 8, table(take(1.0, 4) as constant), 2, 2, true)
         [NULL, 0.5, 1, 2]
         */
-        return rolling_controls_regression(target, controls, window, min_periods, intercept).residual
+        input_target = target
+        input_controls = controls
+        if (type(fill) != VOID && size(target) > 0) {
+            n = size(target)
+            filled = fill_regression_inputs(target, controls, take("sequence", n), long(0 .. (n - 1)), fill)
+            input_target = filled.target
+            input_controls = filled.controls
+        }
+        return rolling_controls_regression(input_target, input_controls, window, min_periods, intercept).residual
     }
     """,
-    dependencies=(ROLLING_CONTROLS_REGRESSION,),
+    dependencies=(ROLLING_CONTROLS_REGRESSION, FILL_REGRESSION_INPUTS),
 )
 
 TS_BINARY_CROSS_ABOVE = DolphinDBFunction(

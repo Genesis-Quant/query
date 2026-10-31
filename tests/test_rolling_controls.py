@@ -20,7 +20,7 @@ def node(operation, *, controls=None, **params):
         "type": "TS" if rolling else "CS",
         "op": operation,
         "fields": {"target": "target", "controls": ["x", "z"] if controls is None else controls},
-        "params": {**({"window": 8} if rolling else {}), **params},
+        "params": {**({"window": 8, "fill": None} if rolling else {}), **params},
     }
 
 
@@ -66,6 +66,7 @@ def test_controls_regression_is_shared_from_common():
     from query.database.compile.common.functions import (
         COMMON_FUNCTIONS,
         CONTROLS_REGRESSION,
+        FILL_REGRESSION_INPUTS,
         ROLLING_CONTROLS_REGRESSION,
     )
     from query.database.compile.common.functions.numeric import (
@@ -83,7 +84,7 @@ def test_controls_regression_is_shared_from_common():
     assert ROLLING_CONTROLS_REGRESSION in COMMON_FUNCTIONS
     for suffix in ("ALPHA", "BETA", "RESIDUAL"):
         assert getattr(time_series, "TS_CONTROLS_ROLLING_" + suffix).dependencies == (
-            ROLLING_CONTROLS_REGRESSION,
+            ROLLING_CONTROLS_REGRESSION, FILL_REGRESSION_INPUTS,
         )
     assert collect_functions([CONTROLS_REGRESSION], "common")[-1] is CONTROLS_REGRESSION
     assert compile().count("def controls_regression(") == 1
@@ -97,7 +98,7 @@ def test_dos_operator_signatures_accept_raw_fields_and_parameters():
         ts = getattr(time_series, "TS_CONTROLS_ROLLING_" + suffix)
         cs = getattr(cross_section, "CS_CONTROLS_" + suffix)
         index = ("index",) if suffix == "BETA" else ()
-        assert ts.parameters == ("target", "controls", "window", "min_periods", "intercept") + index
+        assert ts.parameters == ("target", "controls", "window", "min_periods", "intercept") + index + ("fill",)
         assert cs.parameters == ("target", "controls", "intercept") + index
         for function in (ts, cs):
             for heading in ("Parameters", "Returns", "Notes", "Examples"):
@@ -412,7 +413,7 @@ def test_direct_dos_functions_match_dsl_outputs(dolphin, cs, intercept):
     args = f'regressionTestSource.target,regressionTestControls,{"" if cs else "8,2,"}{literal}'
     for suffix, name, extra in [("alpha", "alpha", ""), ("residual", "residual", ""),
                                 *[("beta", f"beta{i}", f",{i}") for i in range(4)]]:
-        direct = dolphin.run(f'{prefix}{suffix}({args}{extra})')
+        direct = dolphin.run(f'{prefix}{suffix}({args}{extra}{"" if cs else ",NULL"})')
         np.testing.assert_allclose(direct, actual[name], atol=1e-10, equal_nan=True)
     with pytest.raises(RuntimeError, match="index"):
         dolphin.run(f'{prefix}beta({args},-1)')

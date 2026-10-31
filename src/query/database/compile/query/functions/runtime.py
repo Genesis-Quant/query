@@ -2,12 +2,18 @@
 
 from query.database.compile import DolphinDBFunction
 from query.database.compile.common.functions import (
+    CONTROLS_REGRESSION,
+    CONTROLS_REGRESSION_BATCH,
+    FILL_REGRESSION_INPUTS,
     IS_DICTIONARY_FORM,
+    IS_FINITE_NUMBER,
     IS_SCALAR_FORM,
     IS_TABLE_FORM,
     IS_VECTOR_FORM,
+    NORMALIZE_REGRESSION_FILL,
     REQUIRE_TABLE_COLUMNS,
     ROLLING_CONTROLS_REGRESSION,
+    ROLLING_MIN_PERIODS,
 )
 
 FILL_NULL_COLUMN = DolphinDBFunction(
@@ -245,8 +251,16 @@ APPLY_CONTROLLED_CROSS_SECTION = DolphinDBFunction(
 APPLY_ROLLING_OLS = DolphinDBFunction(
     module="query",
     definition="""
-    def apply_rolling_ols(target, controls, on, code, time, window, min_periods, intercept) {
-        // 按证券、日期拟合一次全部系数，再恢复到原面板位置；on 不改变外层行域。
+    def apply_rolling_ols(target, controls, on, code, time, window, min_periods, intercept, fill="ffill") {
+        /*
+        按股票自己的 on 序列组织右对齐窗口；公共设计矩阵按日期分组后多目标拟合。
+        行签名只用于候选筛选，合批前逐项核对完整窗口的时间、控制值和共同有效掩码。
+        不同控制或缺失模式不共享系数；无可合批输入直接沿用逐股票路径。
+        数值拟合由 common 辅助函数完成；结果恢复原行顺序，on=false/NULL 保持 NULL。
+        fill 默认对目标和控制均 ffill；NULL 禁用，constant 和 mean 或逐列配置均先填
+        当前 on 参与行再构造窗口。mean 仅用该日该列原始有限值，分类 mean 报错。
+        不填输出、不向前补区间外历史；填补成功的输入计入 min_periods 和当天残差。
+        */
         n = size(target)
         output = dict(STRING, ANY)
         output["alpha"] = take(double(NULL), n)
@@ -256,11 +270,114 @@ APPLY_ROLLING_OLS = DolphinDBFunction(
         if (type(on) != VOID) mask = normalize_on(on, n)
         selected = table(long(0 .. (n - 1)) as row_id, string(code) as code, timestamp(time) as time)
         selected = selected[mask]
+        selected = select * from selected order by code, time, row_id
+        input_target = target
+        input_controls = controls
+        if (type(fill) != VOID && selected.rows() > 0) {
+            indices = selected.row_id
+            filled = fill_regression_inputs(target[indices], controls[indices], code[indices], time[indices], fill)
+            input_target = take(double(NULL), n)
+            input_target[indices] = filled.target
+            input_controls = controls.copy()
+            for (name in controls.columnNames()) {
+                values = controls[name].copy()
+                if (type(filled.controls[name]) == DOUBLE) values = double(values)
+                values[indices] = filled.controls[name]
+                replaceColumn!(input_controls, symbol([name])[0], values)
+            }
+        }
+        if (window > 1 && selected.rows() >= int(window) * 2 && size(distinct(selected.code)) > 1) {
+            minimum = rolling_min_periods(window, min_periods)
+            if (isNull(window) || window < 1 || window != int(window) || minimum < 1 || minimum > window)
+                throw "滚动回归窗口参数无效"
+            if (!(type(input_target) in [CHAR, SHORT, INT, LONG, FLOAT, DOUBLE]))
+                throw "回归 target 必须是数值"
+            valid = is_finite_number(input_target)
+            row_keys = array(ANY, 0)
+            row_keys.append!(timestamp(time))
+            for (name in input_controls.columnNames()) {
+                values = input_controls[name]
+                if (type(values) in [BOOL, SYMBOL, STRING]) valid = valid && isValid(values)
+                else valid = valid && is_finite_number(values)
+                row_keys.append!(values)
+            }
+            row_keys.append!(valid)
+            signatures = contextby(min, long(0 .. (n - 1)), row_keys)
+            selected["signature"] = signatures[selected.row_id]
+            if (size(distinct(selected.signature)) * 2 <= selected.rows()) {
+                selected["position"] = long(0 .. (selected.rows() - 1))
+                selected["valid"] = valid[selected.row_id]
+                selected["signature_hash"] = long(hashBucket(selected.signature, 2147483647))
+                windows = select *,
+                    mcount(signature, int(window), 1) as span,
+                    msum(signature, int(window), 1) as key1,
+                    msum(signature_hash, int(window), 1) as key2,
+                    msum(int(valid), int(window), 1) as nobs
+                    from selected context by code csort time, row_id
+                candidates = select * from windows where nobs >= minimum
+                batches = select toArray(position) as members from candidates
+                    group by time, span, key1, key2, nobs having count(*) > 1
+                handled = windows.nobs < minimum
+                for (batch in 0 : batches.rows()) {
+                    members = flatten(batches.members[batch,])
+                    for (leader in members) {
+                        if (handled[leader]) continue
+                        first = leader - int(windows.span[leader]) + 1
+                        positions = first .. leader
+                        reference = windows.signature[positions]
+                        peers = array(LONG, 0)
+                        peer_windows = array(ANY, 0)
+                        for (member in members[!handled[members]]) {
+                            other = (member - int(windows.span[member]) + 1) .. member
+                            if (all(reference == windows.signature[other])) {
+                                peers.append!(member)
+                                peer_windows.append!(windows.row_id[other])
+                            }
+                        }
+                        if (size(peers) < 2) continue
+                        valid_rows = windows.valid[positions]
+                        targets = array(ANY, 0)
+                        for (indices in peer_windows) targets.append!(double(input_target[indices[valid_rows]]))
+                        indices = windows.row_id[positions]
+                        fit = controls_regression_batch(
+                            matrix(targets), input_controls[indices[valid_rows]], intercept, last(valid_rows)
+                        )
+                        rows = windows.row_id[peers]
+                        output["alpha"][rows] = fit.alpha
+                        output["residual"][rows] = fit.residual
+                        if (size(fit.names) > 0) {
+                            for (j in 0 .. (size(fit.names) - 1)) {
+                                name = "beta" + string(j)
+                                if (!(name in output)) output[name] = take(double(NULL), n)
+                                output[name][rows] = flatten(fit.beta[j,])
+                            }
+                        }
+                        handled[peers] = true
+                    }
+                }
+                for (position in windows.position[!handled]) {
+                    positions = (position - int(windows.span[position]) + 1) .. position
+                    indices = windows.row_id[positions]
+                    fit = controls_regression(input_target[indices], input_controls[indices], intercept)
+                    row = windows.row_id[position]
+                    output["alpha"][row] = fit.alpha
+                    output["residual"][row] = last(fit.residual)
+                    if (size(fit.beta) > 0) {
+                        for (j in 0 .. (size(fit.beta) - 1)) {
+                            name = "beta" + string(j)
+                            if (!(name in output)) output[name] = take(double(NULL), n)
+                            output[name][row] = fit.beta[j]
+                        }
+                    }
+                }
+                return transpose(output)
+            }
+        }
         for (current_code in distinct(selected.code)) {
             rows = select row_id, time from selected where code = current_code order by time, row_id
             indices = rows.row_id
             coefficients = rolling_controls_regression(
-                target[indices], controls[indices], window, min_periods, intercept
+                input_target[indices], input_controls[indices], window, min_periods, intercept
             )
             for (name in coefficients.columnNames()) {
                 if (!(name in output)) output[name] = take(double(NULL), n)
@@ -272,7 +389,16 @@ APPLY_ROLLING_OLS = DolphinDBFunction(
         return transpose(output)
     }
     """,
-    dependencies=(NORMALIZE_ON, ROLLING_CONTROLS_REGRESSION),
+    dependencies=(
+        NORMALIZE_ON,
+        ROLLING_CONTROLS_REGRESSION,
+        CONTROLS_REGRESSION,
+        CONTROLS_REGRESSION_BATCH,
+        ROLLING_MIN_PERIODS,
+        IS_FINITE_NUMBER,
+        FILL_REGRESSION_INPUTS,
+        NORMALIZE_REGRESSION_FILL,
+    ),
 )
 
 BUILD_CONTROL_TABLE = DolphinDBFunction(

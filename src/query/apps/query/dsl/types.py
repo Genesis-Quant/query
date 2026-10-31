@@ -3,7 +3,7 @@
 import math
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 JsonScalar = str | int | float | bool | None
 OutputKind = Literal["BOOL", "NUMBER", "ANY"]
@@ -37,3 +37,39 @@ class StrictModel(BaseModel):
         for field_name, field_value in self.__dict__.items():
             check(field_value, field_name)
         return self
+
+
+class RegressionFillRule(StrictModel):
+    """回归单列缺失填充；常量必须显式给出且保持数值或分类类型。"""
+
+    method: Literal["constant", "ffill", "mean"] = Field(
+        default="ffill", description="constant 填指定常量，ffill 按股票前向填充，mean 填同日截面均值。"
+    )
+    value: JsonScalar = Field(default=None, description="仅 constant 使用的非 NULL、有限数值或非空分类常量；空字符串在 DolphinDB 中仍为缺失。")
+
+    @model_validator(mode="after")
+    def validate_value(self) -> "RegressionFillRule":
+        if self.method == "constant":
+            if self.value is None or self.value == "":
+                raise ValueError("constant 填充必须指定非 NULL、非空字符串的 value")
+        elif self.value is not None:
+            raise ValueError("只有 constant 填充允许指定 value")
+        return self
+
+
+RegressionColumnFill = Literal["ffill", "mean"] | RegressionFillRule | None
+
+
+class RegressionFill(StrictModel):
+    """分别设置目标和有序控制列；省略的目标和控制列均默认 ffill。"""
+
+    target: RegressionColumnFill = Field(
+        default="ffill", description="目标填充规则；None 不填充，默认 ffill。"
+    )
+    controls: list[RegressionColumnFill] | None = Field(
+        default=None,
+        description="与 fields.controls 一一对应；列表项 None 不填充，省略或整体 None 表示所有控制默认 ffill。",
+    )
+
+
+RegressionFillMethod = RegressionColumnFill | RegressionFill
