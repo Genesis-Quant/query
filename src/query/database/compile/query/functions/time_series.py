@@ -1,7 +1,9 @@
 """时序算符及其内部辅助 DolphinDB 函数。"""
 
 from query.database.compile import DolphinDBFunction
-from query.database.compile.common.functions import DIVIDE_OR_NULL
+from query.database.compile.common.functions import DIVIDE_OR_NULL, IS_TABLE_FORM, IS_VECTOR_FORM
+
+from .cross_section import CONTROLS_REGRESSION
 
 ROLLING_MIN_PERIODS = DolphinDBFunction(
     module="query",
@@ -58,6 +60,217 @@ ROLLING_INTERCEPT = DolphinDBFunction(
     }
     """,
     dependencies=(ROLLING_SLOPE,),
+)
+ROLLING_CONTROLS_REGRESSION = DolphinDBFunction(
+    module="query",
+    definition=r"""
+    def rolling_controls_regression(target, controls, window, min_periods, intercept) {
+        /*
+        内部滚动回归辅助函数，不登记为算符；为三个标量输出共用每个窗口的同一次拟合。
+
+        Parameters
+        ----------
+        target : vector[NUMBER]
+            一只证券已按时间升序排列的目标序列。
+        controls : table
+            同行数的有序解释变量；允许连续、BOOL、STRING、SYMBOL，各窗口独立编码。
+        window : int
+            右对齐的观测行窗口，包含当前行；缺失行占窗口位置，不向前凑样本。
+        min_periods : int or NULL
+            最少共同有效观测数，NULL 等于 window；不足时该窗口所有输出为 NULL。
+        intercept : bool
+            正常回归是否含截距；其余编码和退化规则与 controls_regression 相同。
+
+        Returns
+        -------
+        result : table
+            内部使用的 alpha、residual、beta0...数值列；每行对应原输入位置。
+            residual 只取当前行在当前窗口拟合下的残差，不返回整个窗口残差数组。
+
+        Notes
+        -----
+        alpha/beta 可在当前行缺失但窗口仍有足够共同样本时有效；当前残差仍为 NULL。
+        分类展开列顺序由当前窗口决定，无未来类别；该窗口不存在的系数位置为 NULL。
+        不输出矩阵或数组因子，不将每次回归残差重新应用于以后的窗口。
+        */
+        if (!is_vector_form(target) || !is_table_form(controls) || controls.rows() != size(target) || controls.cols() == 0)
+            throw "回归 target 和 controls 必须等长且解释变量非空"
+        minimum = rolling_min_periods(window, min_periods)
+        if (isNull(window) || window < 1 || window != int(window) || minimum < 1 || minimum > window)
+            throw "滚动回归窗口参数无效"
+        n = size(target)
+        output = dict(STRING, ANY)
+        output["alpha"] = take(double(NULL), n)
+        output["residual"] = take(double(NULL), n)
+        if (n == 0) return transpose(output)
+        for (i in 0 .. (n - 1)) {
+            indices = max(0, i - int(window) + 1) .. i
+            fit = controls_regression(target[indices], controls[indices], intercept)
+            if (fit.nobs < minimum) continue
+            values = output["alpha"]
+            values[i] = fit.alpha
+            output["alpha"] = values
+            values = output["residual"]
+            values[i] = last(fit.residual)
+            output["residual"] = values
+            if (size(fit.beta) > 0) {
+                for (j in 0 .. (size(fit.beta) - 1)) {
+                    name = "beta" + string(j)
+                    if (!(name in output)) output[name] = take(double(NULL), n)
+                    values = output[name]
+                    values[i] = fit.beta[j]
+                    output[name] = values
+                }
+            }
+        }
+        return transpose(output)
+    }
+    """,
+    dependencies=(ROLLING_MIN_PERIODS, CONTROLS_REGRESSION, IS_TABLE_FORM, IS_VECTOR_FORM),
+)
+
+TS_CONTROLS_ROLLING_ALPHA = DolphinDBFunction(
+    module="query",
+    definition=r"""
+    def ts_controls_rolling_alpha(target, controls, window, min_periods, intercept) {
+        /*
+        在右对齐多元滚动 OLS 中返回截距；函数独立接收原始目标和控制变量。
+
+        Parameters
+        ----------
+        target : vector[NUMBER]
+            一只证券按时间排序的数值因变量。
+        controls : table
+            同行数、有序的连续或分类变量；BOOL、STRING、SYMBOL 独热编码并删除首类。
+        window : int
+            当前观测及前 window-1 个观测，按行计数。
+        min_periods : int or NULL
+            最少共同有效样本，NULL 默认 window；缺失观测不跳位置。
+        intercept : bool
+            正常拟合是否含截距；退化窗口沿用 CS 的去均值规则。
+
+        Returns
+        -------
+        result : vector[NUMBER]
+            与目标等长的 DOUBLE 截距序列；历史不足、on=false 的恢复位置为 NULL。
+
+        Notes
+        -----
+        目标、全部控制共同排除 NULL/非有限输入，分类基准仅取当前窗口的有效类别。
+        alpha/beta 不代表整个窗口残差波动率；rolling_residual 只返回当前行残差。
+        正常回归 intercept=false 时为 0；无有效控制列或小样本退化时为有效 target 均值。
+        当前行缺失不影响此前有效样本参与拟合，达到 min_periods 仍可输出截距。
+
+        Examples
+        --------
+        >>> ts_controls_rolling_alpha(1.0 3 5 7 9 11, table(0.0 1 2 3 4 5 as x), 4, 4, true)
+        [NULL, NULL, NULL, 1, 1, 1]
+        >>> ts_controls_rolling_alpha(1.0 2 4 8, table(take(1.0, 4) as constant), 2, 2, false)
+        [NULL, 1.5, 3, 6]
+        */
+        return rolling_controls_regression(target, controls, window, min_periods, intercept).alpha
+    }
+    """,
+    dependencies=(ROLLING_CONTROLS_REGRESSION,),
+)
+
+TS_CONTROLS_ROLLING_BETA = DolphinDBFunction(
+    module="query",
+    definition=r"""
+    def ts_controls_rolling_beta(target, controls, window, min_periods, intercept, index) {
+        /*
+        在右对齐多元滚动 OLS 中返回指定解释变量系数；函数独立接收原始目标和控制变量。
+
+        Parameters
+        ----------
+        target : vector[NUMBER]
+            一只证券按时间排序的数值因变量。
+        controls : table
+            同行数、有序的连续或分类变量；BOOL、STRING、SYMBOL 独热编码并删除首类。
+        window : int
+            当前观测及前 window-1 个观测，按行计数。
+        min_periods : int or NULL
+            最少共同有效样本，NULL 默认 window；缺失观测不跳位置。
+        intercept : bool
+            正常拟合是否含截距；退化窗口沿用 CS 的去均值规则。
+        index : int
+            0 起算的当前窗口展开列位置，不包含截距；不存在时返回 NULL。
+
+        Returns
+        -------
+        result : vector[NUMBER]
+            与目标等长的 DOUBLE 指定解释变量系数序列；历史不足、on=false 的恢复位置为 NULL。
+
+        Notes
+        -----
+        目标、全部控制共同排除 NULL/非有限输入，分类基准仅取当前窗口的有效类别。
+        alpha/beta 不代表整个窗口残差波动率；rolling_residual 只返回当前行残差。
+        展开顺序先按 controls 列顺序，再按每列当前窗口有效类别升序删首类。
+        数值常量列保留位置且系数为 0，分类只有一类时不占展开位置。
+        不同窗口类别变化会改变索引对应的类别；没有该位置时为 NULL，不补 0。
+
+        Examples
+        --------
+        >>> ts_controls_rolling_beta(1.0 3 5 7 9 11, table(0.0 1 2 3 4 5 as x), 4, 4, true, 0)
+        [NULL, NULL, NULL, 2, 2, 2]
+        >>> ts_controls_rolling_beta(1.0 3 5 7, table(0.0 1 2 3 as x), 4, 4, true, 1)
+        [NULL, NULL, NULL, NULL]
+        */
+        if (isNull(index) || index < 0 || index != int(index)) throw "回归系数 index 必须是非负整数"
+        coefficients = rolling_controls_regression(target, controls, window, min_periods, intercept)
+        name = "beta" + string(int(index))
+        if (!(name in coefficients.columnNames())) return take(double(NULL), size(target))
+        return coefficients[name]
+    }
+    """,
+    dependencies=(ROLLING_CONTROLS_REGRESSION,),
+)
+
+TS_CONTROLS_ROLLING_RESIDUAL = DolphinDBFunction(
+    module="query",
+    definition=r"""
+    def ts_controls_rolling_residual(target, controls, window, min_periods, intercept) {
+        /*
+        在右对齐多元滚动 OLS 中返回当前观测残差；函数独立接收原始目标和控制变量。
+
+        Parameters
+        ----------
+        target : vector[NUMBER]
+            一只证券按时间排序的数值因变量。
+        controls : table
+            同行数、有序的连续或分类变量；BOOL、STRING、SYMBOL 独热编码并删除首类。
+        window : int
+            当前观测及前 window-1 个观测，按行计数。
+        min_periods : int or NULL
+            最少共同有效样本，NULL 默认 window；缺失观测不跳位置。
+        intercept : bool
+            正常拟合是否含截距；退化窗口沿用 CS 的去均值规则。
+
+        Returns
+        -------
+        result : vector[NUMBER]
+            与目标等长的 DOUBLE 当前观测残差序列；历史不足、on=false 的恢复位置为 NULL。
+
+        Notes
+        -----
+        目标、全部控制共同排除 NULL/非有限输入，分类基准仅取当前窗口的有效类别。
+        alpha/beta 不代表整个窗口残差波动率；rolling_residual 只返回当前行残差。
+        当前目标或任一控制缺失时，当天残差为 NULL；不能以前一天残差填补。
+        窗口无有效控制或样本不足时沿用去均值退化，当天输出 y_t-avg(y)。
+        后续 rolling_std/rolling_mean 统计的是逐日各自拟合的残差序列，
+        不是把当天系数应用于当前窗口全部历史观测后重新计算的同窗残差统计。
+
+        Examples
+        --------
+        >>> ts_controls_rolling_residual(1.0 3 5 7 9 11, table(0.0 1 2 3 4 5 as x), 4, 4, true)
+        [NULL, NULL, NULL, 0, 0, 0]
+        >>> ts_controls_rolling_residual(1.0 2 4 8, table(take(1.0, 4) as constant), 2, 2, true)
+        [NULL, 0.5, 1, 2]
+        */
+        return rolling_controls_regression(target, controls, window, min_periods, intercept).residual
+    }
+    """,
+    dependencies=(ROLLING_CONTROLS_REGRESSION,),
 )
 
 ROLLING_TRUE_COUNT = DolphinDBFunction(
@@ -6819,6 +7032,9 @@ TIME_SERIES_OPERATOR_FUNCTIONS = (
     TS_BINARY_ROLLING_CORR,
     TS_BINARY_ROLLING_COV,
     TS_BINARY_ROLLING_RESIDUAL,
+    TS_CONTROLS_ROLLING_ALPHA,
+    TS_CONTROLS_ROLLING_BETA,
+    TS_CONTROLS_ROLLING_RESIDUAL,
     TS_TALIB_AD,
     TS_TALIB_ADX,
     TS_TALIB_ADXR,

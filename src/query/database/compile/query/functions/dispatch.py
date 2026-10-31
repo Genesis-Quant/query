@@ -259,6 +259,40 @@ EVALUATE_TIME_SERIES = DolphinDBFunction(
             on = evaluate_operand(evaluator, source, definitions, cache, states, node["on"])
         }
 
+        if (op in ["controls.rolling_alpha", "controls.rolling_beta", "controls.rolling_residual"]) {
+            specification = dict(STRING, ANY)
+            specification["fields"] = node["fields"]
+            specification["window"] = int(params["window"])
+            specification["minimum"] = rolling_min_periods(params["window"], int(params["min_periods"]))
+            specification["intercept"] = params["intercept"]
+            specification["on"] = NULL
+            if ("on" in node) specification["on"] = node["on"]
+            cache_key = "_query_rolling_ols_" + toStdJson(specification)
+            for (attempt in 0 .. size(definitions)) {
+                if (!(cache_key in definitions)) break
+                cache_key = "_" + cache_key
+            }
+            if (!(cache_key in cache)) {
+                target = require_vector(fields["target"], n, op + ".fields.target")
+                control_values = array(ANY, 0)
+                for (i in 0 .. (size(fields["controls"]) - 1)) {
+                    control_values.append!(require_vector(fields["controls"][i], n, op + ".fields.controls"))
+                }
+                controls = build_control_table(control_values)
+                cache[cache_key] = apply_rolling_ols(
+                    target, controls, on, code, time,
+                    params["window"], int(params["min_periods"]), params["intercept"]
+                )
+            }
+            coefficients = cache[cache_key]
+            if (op == "controls.rolling_alpha") return coefficients.alpha
+            if (op == "controls.rolling_residual") return coefficients.residual
+            index = int(params["index"])
+            name = "beta" + string(index)
+            if (index < 0) throw "回归系数 index 必须是非负整数"
+            if (!(name in coefficients.columnNames())) return take(double(NULL), n)
+            return coefficients[name]
+        }
         if (op == "binary.cross_above") {
             left = require_vector(fields["left"], n, op + ".fields.left")
             right = require_vector(fields["right"], n, op + ".fields.right")
@@ -954,7 +988,7 @@ EVALUATE_CROSS_SECTION = DolphinDBFunction(
             handler = cs_binary_residual
             return apply_cross_section(handler, (left, right), on, time, double([]))
         }
-        if (op == "controls.neutralize_by") {
+        if (op in ["controls.alpha", "controls.beta", "controls.residual"]) {
             target = require_vector(fields["target"], n, op + ".fields.target")
             control_values = fields["controls"]
             normalized_controls = array(ANY, 0)
@@ -968,7 +1002,9 @@ EVALUATE_CROSS_SECTION = DolphinDBFunction(
                 )
             }
             controls = build_control_table(normalized_controls)
-            handler = cs_controls_neutralize_by{,, params["intercept"]}
+            if (op == "controls.alpha") handler = cs_controls_alpha{,, params["intercept"]}
+            else if (op == "controls.beta") handler = cs_controls_beta{,, params["intercept"], params["index"]}
+            else handler = cs_controls_residual{,, params["intercept"]}
             return apply_controlled_cross_section(handler, target, controls, on, time)
         }
         if (op == "grouped.demean") {

@@ -9,6 +9,8 @@ from query.database.compile.common.functions import (
     REQUIRE_TABLE_COLUMNS,
 )
 
+from .time_series import ROLLING_CONTROLS_REGRESSION
+
 FILL_NULL_COLUMN = DolphinDBFunction(
     module="query",
     definition="""
@@ -241,6 +243,39 @@ APPLY_CONTROLLED_CROSS_SECTION = DolphinDBFunction(
     dependencies=(NORMALIZE_ON,),
 )
 
+APPLY_ROLLING_OLS = DolphinDBFunction(
+    module="query",
+    definition="""
+    def apply_rolling_ols(target, controls, on, code, time, window, min_periods, intercept) {
+        // 按证券、日期拟合一次全部系数，再恢复到原面板位置；on 不改变外层行域。
+        n = size(target)
+        output = dict(STRING, ANY)
+        output["alpha"] = take(double(NULL), n)
+        output["residual"] = take(double(NULL), n)
+        if (n == 0) return transpose(output)
+        mask = take(true, n)
+        if (type(on) != VOID) mask = normalize_on(on, n)
+        selected = table(long(0 .. (n - 1)) as row_id, string(code) as code, timestamp(time) as time)
+        selected = selected[mask]
+        for (current_code in distinct(selected.code)) {
+            rows = select row_id, time from selected where code = current_code order by time, row_id
+            indices = rows.row_id
+            coefficients = rolling_controls_regression(
+                target[indices], controls[indices], window, min_periods, intercept
+            )
+            for (name in coefficients.columnNames()) {
+                if (!(name in output)) output[name] = take(double(NULL), n)
+                values = output[name]
+                values[indices] = coefficients[name]
+                output[name] = values
+            }
+        }
+        return transpose(output)
+    }
+    """,
+    dependencies=(NORMALIZE_ON, ROLLING_CONTROLS_REGRESSION),
+)
+
 BUILD_CONTROL_TABLE = DolphinDBFunction(
     module="query",
     definition="""
@@ -251,7 +286,9 @@ BUILD_CONTROL_TABLE = DolphinDBFunction(
         for (index in 0..(size(values) - 1)) {
             columns["control" + string(index)] = values[index]
         }
-        return transpose(columns)
+        result = transpose(columns)
+        reorderColumns!(result, "control" + string(0 .. (size(values) - 1)))
+        return result
     }
     """
 )
@@ -752,6 +789,7 @@ TOOL_FUNCTIONS = (
     APPLY_CROSS_SECTION,
     APPLY_GROUPED_CROSS_SECTION,
     APPLY_CONTROLLED_CROSS_SECTION,
+    APPLY_ROLLING_OLS,
     BUILD_CONTROL_TABLE,
     REQUIRE_KEY,
     REQUIRE_VECTOR,

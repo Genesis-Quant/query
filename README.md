@@ -79,6 +79,54 @@ derivatives = {
 
 `build_factor_source(data, codes, factors, dates, start_time, end_time)` 内部以 `default` / `fixed_code` 两个分支构造数据，已删除 `seed_factors` 参数及全部历史补值逻辑；新增引用类型只扩展类型分发和对应构造器，不修改现有 DSL 算符。字段分类仍定义在原来的 Workers 中，查询编译直接复用已有常量，不另建字段目录。
 
+## 多元回归
+
+六个算符共用 `fields={"target": ..., "controls": [...]}`，每个结果仍是一列数值，不输出数组或矩阵：
+
+| 类型 | op | 结果 | params |
+| --- | --- | --- | --- |
+| TS | `controls.rolling_alpha` | 当前窗口截距 | `window`, `min_periods=None`, `intercept=True` |
+| TS | `controls.rolling_beta` | 当前窗口指定解释变量系数 | 同上，另有 `index=0` |
+| TS | `controls.rolling_residual` | 当前观测在当前窗口拟合下的残差 | 同 alpha |
+| CS | `controls.alpha` | 当前截面截距，广播到共同有效行 | `intercept=True` |
+| CS | `controls.beta` | 当前截面指定解释变量系数，广播到共同有效行 | `intercept=True`, `index=0` |
+| CS | `controls.residual` | 当前截面每个共同有效观测的残差 | `intercept=True` |
+
+`controls` 按列表顺序输入，可混合连续数值与 BOOL、STRING、SYMBOL 分类变量。分类变量只用当前窗口/截面的共同有效样本独热编码，类别升序排列并删除首类；NULL 不成为一个类别。数值 NULL、NaN、正负无穷以及分类 NULL 的行共同排除，不补值。
+
+`beta.index` 从 0 起算，指删除基准类别后的展开列，不包含截距；先按控制变量原顺序，再按分类值升序展开。数值常量列保留位置且系数为 0；只有一个有效类别的分类列不占位置；不存在的索引输出 NULL。分类类别变化会改变该索引含义，不使用未来类别来固定展开位置。正常拟合使用 SVD 伪逆，秩亏时取最小范数最小二乘解。
+
+TS 按证券、日期排序，`on` 先筛选观测序列，`window` 按筛选后的行数计数；窗口内缺失行仍占位置，不跳过缺失向前凑样本。`min_periods` 为最少共同有效样本数，默认等于 `window`。不够时所有结果为 NULL；足够时，即使当前行缺失也可输出 alpha/beta，但当天 residual 为 NULL。`on=false/NULL` 行在恢复面板位置后仍为 NULL。
+
+沿用原截面中性化的退化规则：没有有效控制列、单样本或有效样本数不大于活动控制列数加截距项数时，返回去均值回归，即 `alpha=avg(y)`、已有系数位置 `beta=0`、`residual=y-avg(y)`；这一退化规则也适用于 `intercept=False`。正常无截距回归的 alpha 为 0。CS 无效行的全部输出为 NULL。
+
+```python
+derivatives = {
+    "market_return": {
+        "type": "TS", "op": "unary.pct_change",
+        "fields": {"col": "close@000852.SH"}, "params": {"periods": 1},
+    },
+    "daily_return": {
+        "type": "TS", "op": "unary.pct_change",
+        "fields": {"col": "close_hfq"}, "params": {"periods": 1},
+    },
+    "daily_residual": {
+        "type": "TS", "op": "controls.rolling_residual",
+        "fields": {"target": "daily_return", "controls": ["market_return"]},
+        "params": {"window": 63, "min_periods": 63, "intercept": True},
+    },
+    "residual_volatility": {
+        "type": "TS", "op": "unary.rolling_std",
+        "fields": {"col": "daily_residual"},
+        "params": {"window": 63, "min_periods": 63},
+    },
+}
+```
+
+上例统计的是每日各自滚动拟合的当天残差序列，而不是用当天系数重新计算当前窗口全部历史残差。需用 `lookback` 显式覆盖收益、回归和后续统计的预热区间；不要把预热 NULL 填 0。相同输入、窗口、有效样本要求、截距和 `on` 的 TS alpha/beta/residual 共用拟合结果；既有 `binary.rolling_alpha/beta/residual` 不变。
+
+各公开 DOS 函数直接接收原始 `target, controls` 和对应参数：`ts_controls_rolling_alpha/residual(target, controls, window, min_periods, intercept)`，beta 末尾另加 `index`；CS 省略窗口参数。`controls` 是等行数、有序控制列的表。内部拟合结果不会作为公开算符输入。旧截面中性化名称已删除，不提供兼容别名；`controls.residual` 不自动去极值、标准化，也不能替代应用的完整因子预处理。
+
 ## 命令行
 
 ```bash

@@ -97,8 +97,8 @@ class GroupedFields(StrictModel):
 class ControlsFields(StrictModel):
     """包含回归目标和一个或多个控制变量。"""
 
-    target: Operand = Field(..., description="需要中性化的数值目标。")
-    controls: list[Operand] = Field(..., min_length=1, description="分类或连续控制变量列表。")
+    target: Operand = Field(..., description="回归因变量，必须为数值目标。")
+    controls: list[Operand] = Field(..., min_length=1, description="有序的连续数值或 BOOL/STRING/SYMBOL 分类解释变量列表。")
 
 
 class OHLCFields(StrictModel):

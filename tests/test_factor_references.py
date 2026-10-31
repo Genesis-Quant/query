@@ -86,7 +86,8 @@ def test_reference_strings_use_existing_schema_and_dependency_discovery():
     assert parameters["columns"].tolist() == ["time", "code", "index_return", "excess"]
     assert FactorQuery.model_validate_json(request.model_dump_json()) == request
     assert "factor@code" in compile()
-    assert len(Derivative.operators) == 231
+    assert "unary.pct_change" in Derivative.operators
+    assert not any("@" in name for name in Derivative.operators)
 
 
 def test_source_builders_have_no_initial_value_parameters_or_pre_start_reads():

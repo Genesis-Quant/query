@@ -1,7 +1,7 @@
 """截面算符共用的 DolphinDB 函数。"""
 
 from query.database.compile import DolphinDBFunction
-from query.database.compile.common.functions import IS_FINITE_NUMBER
+from query.database.compile.common.functions import IS_FINITE_NUMBER, IS_TABLE_FORM, IS_VECTOR_FORM
 
 BROADCAST_LIKE = DolphinDBFunction(
     module="query",
@@ -390,155 +390,231 @@ CS_BINARY_RESIDUAL = DolphinDBFunction(
     dependencies=(CROSS_SECTION_SLOPE,)
 )
 
-CS_CONTROLS_NEUTRALIZE_BY = DolphinDBFunction(
+CONTROLS_REGRESSION = DolphinDBFunction(
     module="query",
-    definition="""
-    def cs_controls_neutralize_by(target, controls, intercept) {
+    definition=r"""
+    def controls_regression(target, controls, intercept) {
         /*
-        对连续和分类控制变量执行截面 OLS 回归，返回目标变量的残差。
-
-        只有 target 和所有控制变量均有效的行参加回归；无效行在输出中保持 NULL。数值控制变量直接进入设计矩阵，BOOL、SYMBOL 和 STRING
-        控制变量先独热编码，并为每个分类变量删除第一个水平以避免完全共线。
-
-        独热编码后会删除常量控制列。若没有剩余控制列、有效样本不超过 1，或样本数不大于控制列数加截距项数，则不调用 OLS，而是返回有效 target 的去均值结果。
-
-        正常回归使用 target 作为因变量、controls 作为自变量。函数只返回残差，不自动取对数、去极值或标准化。
+        内部回归辅助函数，不登记为 DSL 算符；CS 和每个 TS 窗口共用原中性化规则。
 
         Parameters
         ----------
-        target : vector
-            需要中性化的数值目标向量。
+        target : vector[NUMBER]
+            回归因变量，允许 NULL；布尔值和非数值目标不作为连续收益处理。
         controls : table
-            控制变量表；每列是一个连续变量或分类变量。
-        intercept : bool, default true
-            true 时在设计矩阵中加入截距项；false 时强制回归通过原点。
+            与 target 等行数的解释变量表，列顺序就是调用方给定的顺序。
+            数值列直接进入设计矩阵；BOOL、STRING、SYMBOL 先独热编码，
+            各分类列按类别值升序去掉第一个水平。类别缺失不是一个类别。
+        intercept : bool
+            正常回归是否包含截距项。
 
         Returns
         -------
-        result : vector[NUMBER]
-            与 target 等长的 DOUBLE 残差向量；未参加回归的行保持 NULL。
+        fit : dictionary
+            valid 为目标和全部控制共同有效的行掩码，nobs 为有效行数；
+            names/beta 按原控制列顺序排列，分类列按非基准类别升序展开。
+            数值常量列保留系数位置且系数为 0，不进入实际拟合。
+            alpha 为截距，residual 与 target 等长，无效行保留 DOUBLE NULL。
 
         Notes
         -----
-        NULL 处理：target 或任一控制变量为 NULL 的行不进入回归，并在结果同位置返回 NULL；数值列中的
-        NaN 和正负无穷同样排除，分类控制的 NULL 不会自动创建为一个类别。若有效控制矩阵退化为无控制列，则对有效
-        target 去均值。
-
-        回归边界：分类列展开为去掉首类的哑变量，连续列直接作为数值控制；intercept 控制是否添加常数项。有效样本不足
-        、秩亏或单样本截面通过最小二乘或去均值规则得到残差，函数不自动取对数、去极值或标准化。
-
-        Examples
-        --------
-        >>> target = 2.0 4.0 3.0 7.0 5.0 9.0
-        >>> industry = `bank`bank`tech`tech`retail`retail
-        >>> size = 10.0 12.0 8.0 11.0 9.0 13.0
-        >>> controls = table(industry, size)
-
-        同时控制行业和连续市值变量：
-        >>> cs_controls_neutralize_by(target, controls, true)
-        [0.103448, -0.103448, -0.344828, 0.344828, 0.206897, -0.206897]
-
-        >>> size = 8.0 9.0 10.0 11.0 12.0
-        >>> target = 1.0 2.2 2.8 4.1 4.9
-        >>> controls = table(size)
-
-        只控制连续变量：
-        >>> cs_controls_neutralize_by(target, controls, true)
-        [-0.06, 0.17, -0.2, 0.13, -0.04]
-
-        >>> target = 1.0 3.0 2.0 6.0 4.0 8.0
-        >>> industry = `bank`bank`tech`tech`retail`retail
-        >>> controls = table(industry)
-
-        只控制分类变量：
-        >>> cs_controls_neutralize_by(target, controls, true)
-        [-1, 1, -2, 2, -2, 2]
-
-        >>> target = 1.0 2.0 3.0 4.0 5.0
-        >>> size = 8.0 9.0 10.0 11.0 12.0
-        >>> target[1] = NULL
-        >>> size[3] = NULL
-        >>> controls = table(size)
-
-        目标或控制变量缺失的行保持 NULL：
-        >>> cs_controls_neutralize_by(target, controls, true)
-        [0, NULL, 0, NULL, 0]
-
-        >>> target = 1.0 2.0 4.0 8.0
-        >>> constant = 1.0 1.0 1.0 1.0
-        >>> controls = table(constant)
-
-        控制变量为常量时退化为截面去均值：
-        >>> cs_controls_neutralize_by(target, controls, true)
-        [-2.75, -1.75, 0.25, 4.25]
-
-        >>> target = 1.0 2.0
-        >>> size = 8.0 9.0
-        >>> controls = table(size)
-
-        有效样本不足时退化为截面去均值：
-        >>> cs_controls_neutralize_by(target, controls, true)
-        [-0.5, 0.5]
-
-        >>> target = 1.0 2.2 2.8 4.1 4.9
-        >>> size = 8.0 9.0 10.0 11.0 12.0
-        >>> controls = table(size)
-
-        不包含截距项：
-        >>> cs_controls_neutralize_by(target, controls, false)
-        [-1.5051, -0.618235, -0.331373, 0.65549, 1.14235]
+        数值输入的 NULL、NaN、正负无穷共同排除，分类输入只排除 NULL。
+        沿用原 CS 退化规则：无可用控制列、单样本或样本数不大于有效参数数时，
+        退化为 y-avg(y)，alpha=avg(y)、beta=0；该退化规则不受 intercept 影响。
+        正常拟合用 SVD 伪逆，秩亏列取最小范数最小二乘解；不取对数、不缩尾、不标准化。
+        分类基准只来自当前截面或当前窗口，不读取未来类别。
         */
+        if (!is_vector_form(target) || !is_table_form(controls))
+            throw "回归 target 必须是向量，controls 必须是表"
         n = size(target)
+        if (controls.rows() != n || controls.cols() == 0)
+            throw "回归解释变量必须与 target 等长且至少有一列"
+        if (!(type(target) in [CHAR, SHORT, INT, LONG, FLOAT, DOUBLE]))
+            throw "回归 target 必须是数值"
         valid = is_finite_number(target)
-        for (name in columnNames(controls)) {
+        for (name in controls.columnNames()) {
             values = controls[name]
             if (type(values) in [BOOL, SYMBOL, STRING]) valid = valid && isValid(values)
             else valid = valid && is_finite_number(values)
         }
-        result = array(DOUBLE, n, n, NULL)
-        if (sum(valid) == 0) return result
+        fit = dict(STRING, ANY)
+        fit["valid"] = valid
+        fit["nobs"] = sum(valid)
+        fit["alpha"] = double(NULL)
+        fit["names"] = array(STRING, 0)
+        fit["beta"] = array(DOUBLE, 0)
+        fit["residual"] = take(double(NULL), n)
+        if (sum(valid) == 0) return fit
         y = double(target[valid])
         x_table = controls[valid]
-        category_names = array(STRING, 0)
-        for (name in columnNames(x_table)) {
-            if (type(x_table[name]) in [BOOL, SYMBOL, STRING]) category_names.append!(name)
+        categories = array(STRING, 0)
+        names = array(STRING, 0)
+        for (name in x_table.columnNames()) {
+            if (type(x_table[name]) in [BOOL, SYMBOL, STRING]) {
+                categories.append!(name)
+                levels = sort(distinct(x_table[name]))
+                if (size(levels) > 1) {
+                    for (j in 1 .. (size(levels) - 1))
+                        names.append!(name + "_" + string(levels[j]))
+                }
+            } else names.append!(name)
         }
         encoded = x_table
-        if (size(category_names) > 0) {
-            encoded = oneHot(x_table, symbol(category_names))
-            drop_names = array(STRING, 0)
-            encoded_names = columnNames(encoded)
-            for (name in category_names) {
-                candidates = encoded_names[startsWith(encoded_names, name + "_")]
-                baseline_name = name + "_" + string(min(x_table[name]))
-                if (baseline_name in candidates) drop_names.append!(baseline_name)
+        if (size(categories) > 0) encoded = oneHot(x_table, symbol(categories))
+        active = array(STRING, 0)
+        for (name in names) {
+            if (!(name in encoded.columnNames())) throw "回归分类编码列不存在：" + name
+            if (size(distinct(encoded[name])) > 1) active.append!(name)
+        }
+        beta = take(0.0, size(names))
+        alpha = avg(y)
+        residual = y - alpha
+        if (size(active) > 0 && size(y) > 1 && size(y) > size(active) + int(intercept)) {
+            design = array(ANY, 0)
+            if (intercept) design.append!(take(1.0, size(y)))
+            for (name in active) design.append!(double(encoded[name]))
+            coefficients = (pinv(matrix(design)) ** matrix(y))[0]
+            alpha = 0.0
+            if (intercept) alpha = coefficients[0]
+            fitted = take(alpha, size(y))
+            for (j in 0 .. (size(active) - 1)) {
+                position = find(names, active[j])
+                beta[position] = coefficients[j + int(intercept)]
+                fitted += beta[position] * double(encoded[active[j]])
             }
-            if (size(drop_names) == columns(encoded)) {
-                result[valid] = y - avg(y)
-                return result
-            }
-            if (size(drop_names) > 0) dropColumns!(encoded, symbol(drop_names))
+            residual = y - fitted
         }
-        constant_names = array(STRING, 0)
-        for (name in columnNames(encoded)) {
-            if (size(distinct(encoded[name])) <= 1) constant_names.append!(name)
-        }
-        if (size(constant_names) == columns(encoded)) {
-            result[valid] = y - avg(y)
-            return result
-        }
-        if (size(constant_names) > 0) dropColumns!(encoded, symbol(constant_names))
-        column_count = columns(encoded)
-        if (size(y) <= 1 || column_count == 0 || size(y) <= column_count + int(intercept)) {
-            residual = y - avg(y)
-        } else {
-            residual = ols(y, matrix(encoded), intercept, 2).Residual
-        }
-        result[valid] = residual
-        return result
+        values = fit["residual"]
+        values[valid] = residual
+        fit["alpha"] = alpha
+        fit["names"] = names
+        fit["beta"] = beta
+        fit["residual"] = values
+        return fit
     }
     """,
-    dependencies=(IS_FINITE_NUMBER,)
+    dependencies=(IS_FINITE_NUMBER, IS_TABLE_FORM, IS_VECTOR_FORM),
+)
+
+CS_CONTROLS_ALPHA = DolphinDBFunction(
+    module="query",
+    definition=r"""
+    def cs_controls_alpha(target, controls, intercept) {
+        /*
+        用连续、BOOL、STRING、SYMBOL 控制变量解释 target，返回截面截距。
+
+        Parameters
+        ----------
+        target : vector[NUMBER]
+            当前截面的数值因变量。
+        controls : table
+            同行数的有序控制列；分类列独热编码后去掉最小类别，常量列不拟合。
+        intercept : bool
+            正常拟合是否包含截距；false 时正常拟合返回 0。
+
+        Returns
+        -------
+        result : vector[NUMBER]
+            与 target 等长；共同有效行广播同一个截距，其余行保持 NULL。
+
+        Notes
+        -----
+        共同排除缺失、非有限数值；无控制或样本不足沿用去均值退化，返回 avg(y)。
+        不执行前向填充、去极值或标准化；分类编码只使用本截面的有效样本。
+
+        Examples
+        --------
+        >>> cs_controls_alpha(1.0 2.2 2.8 4.1 4.9, table(8.0 9 10 11 12 as size), true)
+        [-6.7, -6.7, -6.7, -6.7, -6.7]
+        */
+        fit = controls_regression(target, controls, intercept)
+        return iif(fit.valid, fit.alpha, double(NULL))
+    }
+    """,
+    dependencies=(CONTROLS_REGRESSION,),
+)
+
+CS_CONTROLS_BETA = DolphinDBFunction(
+    module="query",
+    definition=r"""
+    def cs_controls_beta(target, controls, intercept, index) {
+        /*
+        用有序的连续或分类控制列解释 target，返回指定展开列的截面回归系数。
+
+        Parameters
+        ----------
+        target : vector[NUMBER]
+            当前截面的数值因变量。
+        controls : table
+            同行数的解释变量；按列顺序展开，分类列按类别值排序删除首类。
+        intercept : bool
+            正常拟合是否包含截距。
+        index : int
+            0 起算的展开列位置，不包含截距；数值常量列保留位置并返回 0。
+            分类类别和基准以当前截面为准，因此动态类别的索引需由调用方确认。
+
+        Returns
+        -------
+        result : vector[NUMBER]
+            共同有效行广播指定系数，无效行或该截面不存在的展开列为 NULL。
+
+        Notes
+        -----
+        缺失规则与 controls.residual 一致；退化到去均值时已有系数位置返回 0。
+        index<0 或非整数报错，不把类别字符串当连续数字。
+
+        Examples
+        --------
+        >>> cs_controls_beta(1.0 2.2 2.8 4.1 4.9, table(8.0 9 10 11 12 as size), true, 0)
+        [0.97, 0.97, 0.97, 0.97, 0.97]
+        */
+        if (isNull(index) || index < 0 || index != int(index)) throw "回归系数 index 必须是非负整数"
+        fit = controls_regression(target, controls, intercept)
+        if (index >= size(fit.beta)) return take(double(NULL), size(target))
+        return iif(fit.valid, fit.beta[int(index)], double(NULL))
+    }
+    """,
+    dependencies=(CONTROLS_REGRESSION,),
+)
+
+CS_CONTROLS_RESIDUAL = DolphinDBFunction(
+    module="query",
+    definition=r"""
+    def cs_controls_residual(target, controls, intercept) {
+        /*
+        以连续或分类控制变量做截面 OLS，返回各共同有效观测的残差。
+
+        Parameters
+        ----------
+        target : vector[NUMBER]
+            需要解释的数值目标。
+        controls : table
+            与目标等行数的控制表；BOOL、STRING、SYMBOL 独热编码，去首类。
+        intercept : bool
+            正常回归是否包含截距。
+
+        Returns
+        -------
+        result : vector[NUMBER]
+            与 target 等长；无效行保留 NULL，正常行返回 y-alpha-X*beta。
+
+        Notes
+        -----
+        完全替换旧中性化名称，不提供旧算符或 DOS 函数别名。
+        沿用分类基准删除、常量控制删除和小样本去均值规则，不补 NULL。
+        不自动取对数、去极值、标准化，也不是 Scheme 完整因子预处理。
+
+        Examples
+        --------
+        >>> cs_controls_residual(1.0 3 2 6 4 8, table(`bank`bank`tech`tech`retail`retail as industry), true)
+        [-1, 1, -2, 2, -2, 2]
+        >>> cs_controls_residual(1.0 2 4 8, table(take(1.0,4) as constant), true)
+        [-2.75, -1.75, 0.25, 4.25]
+        */
+        return controls_regression(target, controls, intercept).residual
+    }
+    """,
+    dependencies=(CONTROLS_REGRESSION,),
 )
 
 CS_GROUPED_DEMEAN = DolphinDBFunction(
@@ -2117,7 +2193,9 @@ CROSS_SECTION_OPERATOR_FUNCTIONS = (
     CS_BINARY_COV,
     CS_BINARY_RANK_CORR,
     CS_BINARY_RESIDUAL,
-    CS_CONTROLS_NEUTRALIZE_BY,
+    CS_CONTROLS_ALPHA,
+    CS_CONTROLS_BETA,
+    CS_CONTROLS_RESIDUAL,
     CS_GROUPED_DEMEAN,
     CS_GROUPED_MEAN,
     CS_GROUPED_RANK_PCT,
