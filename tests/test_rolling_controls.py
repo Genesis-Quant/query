@@ -61,6 +61,35 @@ def test_beta_index_is_not_limited_to_unexpanded_control_count(operation):
     FactorQuery.model_validate(request({"result": node(operation, controls=["industry"], index=3)}))
 
 
+def test_controls_regression_is_shared_from_common():
+    from query.database.compile import collect_functions
+    from query.database.compile.common.functions import (
+        COMMON_FUNCTIONS,
+        CONTROLS_REGRESSION,
+        ROLLING_CONTROLS_REGRESSION,
+    )
+    from query.database.compile.common.functions.numeric import (
+        CONTROLS_REGRESSION as NUMERIC_CONTROLS_REGRESSION,
+    )
+    from query.database.compile.query.functions import cross_section, time_series
+
+    assert CONTROLS_REGRESSION is NUMERIC_CONTROLS_REGRESSION
+    assert CONTROLS_REGRESSION.module == "common"
+    assert CONTROLS_REGRESSION in COMMON_FUNCTIONS
+    for suffix in ("ALPHA", "BETA", "RESIDUAL"):
+        assert getattr(cross_section, "CS_CONTROLS_" + suffix).dependencies == (CONTROLS_REGRESSION,)
+    assert CONTROLS_REGRESSION in ROLLING_CONTROLS_REGRESSION.dependencies
+    assert ROLLING_CONTROLS_REGRESSION.module == "common"
+    assert ROLLING_CONTROLS_REGRESSION in COMMON_FUNCTIONS
+    for suffix in ("ALPHA", "BETA", "RESIDUAL"):
+        assert getattr(time_series, "TS_CONTROLS_ROLLING_" + suffix).dependencies == (
+            ROLLING_CONTROLS_REGRESSION,
+        )
+    assert collect_functions([CONTROLS_REGRESSION], "common")[-1] is CONTROLS_REGRESSION
+    assert compile().count("def controls_regression(") == 1
+    assert compile().count("def rolling_controls_regression(") == 1
+
+
 def test_dos_operator_signatures_accept_raw_fields_and_parameters():
     from query.database.compile.query.functions import cross_section, time_series
 

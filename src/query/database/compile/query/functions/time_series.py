@@ -1,132 +1,16 @@
-"""时序算符及其内部辅助 DolphinDB 函数。"""
+"""时序算符的 DolphinDB 实现。"""
 
 from query.database.compile import DolphinDBFunction
-from query.database.compile.common.functions import DIVIDE_OR_NULL, IS_TABLE_FORM, IS_VECTOR_FORM
-
-from .cross_section import CONTROLS_REGRESSION
-
-ROLLING_MIN_PERIODS = DolphinDBFunction(
-    module="query",
-    definition="""
-    def rolling_min_periods(window, min_periods) {
-        // 规范化滚动窗口的最少观测数；NULL 表示要求完整 window。
-        if (isNull(min_periods)) return int(window)
-        return int(min_periods)
-    }
-    """
-)
-
-MASK_EXPANDING_RESULT = DolphinDBFunction(
-    module="query",
-    definition="""
-    def mask_expanding_result(result, value, min_periods) {
-        // 在累计有效观测数达到 min_periods 前，将单序列 expanding 结果置为 NULL。
-        return iif(cumcount(value) < int(min_periods), NULL, result)
-    }
-    """
-)
-
-MASK_PAIR_EXPANDING_RESULT = DolphinDBFunction(
-    module="query",
-    definition="""
-    def mask_pair_expanding_result(result, left, right, min_periods) {
-        // 仅统计左右两列同时有效的样本，并遮蔽观测不足的双序列 expanding 结果。
-        valid = iif(isValid(left) && isValid(right), 1, int(NULL))
-        return iif(cumcount(valid) < int(min_periods), NULL, result)
-    }
-    """
-)
-
-ROLLING_SLOPE = DolphinDBFunction(
-    module="query",
-    definition="""
-    def rolling_slope(left, right, window, min_periods) {
-        // 计算 right 关于 left 的滚动 OLS 斜率。
-        return mbeta(right, left, int(window), int(min_periods))
-    }
-    """
-)
-
-ROLLING_INTERCEPT = DolphinDBFunction(
-    module="query",
-    definition="""
-    def rolling_intercept(left, right, window, min_periods) {
-        // 仅使用左右两列同时有效的样本均值计算 right 关于 left 的 OLS 截距。
-        valid = isValid(left) && isValid(right)
-        paired_left = iif(valid, double(left), double(NULL))
-        paired_right = iif(valid, double(right), double(NULL))
-        slope = rolling_slope(left, right, window, min_periods)
-        return mavg(paired_right, int(window), int(min_periods)) - slope * mavg(paired_left, int(window), int(min_periods))
-    }
-    """,
-    dependencies=(ROLLING_SLOPE,),
-)
-ROLLING_CONTROLS_REGRESSION = DolphinDBFunction(
-    module="query",
-    definition=r"""
-    def rolling_controls_regression(target, controls, window, min_periods, intercept) {
-        /*
-        内部滚动回归辅助函数，不登记为算符；为三个标量输出共用每个窗口的同一次拟合。
-
-        Parameters
-        ----------
-        target : vector[NUMBER]
-            一只证券已按时间升序排列的目标序列。
-        controls : table
-            同行数的有序解释变量；允许连续、BOOL、STRING、SYMBOL，各窗口独立编码。
-        window : int
-            右对齐的观测行窗口，包含当前行；缺失行占窗口位置，不向前凑样本。
-        min_periods : int or NULL
-            最少共同有效观测数，NULL 等于 window；不足时该窗口所有输出为 NULL。
-        intercept : bool
-            正常回归是否含截距；其余编码和退化规则与 controls_regression 相同。
-
-        Returns
-        -------
-        result : table
-            内部使用的 alpha、residual、beta0...数值列；每行对应原输入位置。
-            residual 只取当前行在当前窗口拟合下的残差，不返回整个窗口残差数组。
-
-        Notes
-        -----
-        alpha/beta 可在当前行缺失但窗口仍有足够共同样本时有效；当前残差仍为 NULL。
-        分类展开列顺序由当前窗口决定，无未来类别；该窗口不存在的系数位置为 NULL。
-        不输出矩阵或数组因子，不将每次回归残差重新应用于以后的窗口。
-        */
-        if (!is_vector_form(target) || !is_table_form(controls) || controls.rows() != size(target) || controls.cols() == 0)
-            throw "回归 target 和 controls 必须等长且解释变量非空"
-        minimum = rolling_min_periods(window, min_periods)
-        if (isNull(window) || window < 1 || window != int(window) || minimum < 1 || minimum > window)
-            throw "滚动回归窗口参数无效"
-        n = size(target)
-        output = dict(STRING, ANY)
-        output["alpha"] = take(double(NULL), n)
-        output["residual"] = take(double(NULL), n)
-        if (n == 0) return transpose(output)
-        for (i in 0 .. (n - 1)) {
-            indices = max(0, i - int(window) + 1) .. i
-            fit = controls_regression(target[indices], controls[indices], intercept)
-            if (fit.nobs < minimum) continue
-            values = output["alpha"]
-            values[i] = fit.alpha
-            output["alpha"] = values
-            values = output["residual"]
-            values[i] = last(fit.residual)
-            output["residual"] = values
-            if (size(fit.beta) > 0) {
-                for (j in 0 .. (size(fit.beta) - 1)) {
-                    name = "beta" + string(j)
-                    if (!(name in output)) output[name] = take(double(NULL), n)
-                    values = output[name]
-                    values[i] = fit.beta[j]
-                    output[name] = values
-                }
-            }
-        }
-        return transpose(output)
-    }
-    """,
-    dependencies=(ROLLING_MIN_PERIODS, CONTROLS_REGRESSION, IS_TABLE_FORM, IS_VECTOR_FORM),
+from query.database.compile.common.functions import (
+    DIVIDE_OR_NULL,
+    MASK_EXPANDING_RESULT,
+    MASK_PAIR_EXPANDING_RESULT,
+    ROLLING_CONTROLS_REGRESSION,
+    ROLLING_INTERCEPT,
+    ROLLING_MIN_PERIODS,
+    ROLLING_SLOPE,
+    ROLLING_TRUE_COUNT,
+    TALIB_MOVING_AVERAGE,
 )
 
 TS_CONTROLS_ROLLING_ALPHA = DolphinDBFunction(
@@ -271,28 +155,6 @@ TS_CONTROLS_ROLLING_RESIDUAL = DolphinDBFunction(
     }
     """,
     dependencies=(ROLLING_CONTROLS_REGRESSION,),
-)
-
-ROLLING_TRUE_COUNT = DolphinDBFunction(
-    module="query",
-    definition="""
-    def rolling_true_count(value, window, min_periods) {
-        // 将 NULL 按 false 处理，统计每个滚动窗口中的 true 数量。
-        if (type(value) != BOOL) throw "条件型算符的 col 必须是 BOOL"
-        return msum(int(nullFill(value, false)), int(window), int(min_periods))
-    }
-    """
-)
-
-TALIB_MOVING_AVERAGE = DolphinDBFunction(
-    module="query",
-    definition="""
-    def talib_moving_average(value, time_period, ma_type) {
-        // 按 TA-Lib MAType 计算均线；T3 显式使用标准默认参数 vfactor=0.7。
-        if (int(ma_type) == 8) return ta::t3(value, int(time_period), 0.7)
-        return ta::ma(value, int(time_period), int(ma_type))
-    }
-    """
 )
 
 TS_BINARY_CROSS_ABOVE = DolphinDBFunction(

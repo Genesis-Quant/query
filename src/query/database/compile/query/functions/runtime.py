@@ -7,9 +7,8 @@ from query.database.compile.common.functions import (
     IS_TABLE_FORM,
     IS_VECTOR_FORM,
     REQUIRE_TABLE_COLUMNS,
+    ROLLING_CONTROLS_REGRESSION,
 )
-
-from .time_series import ROLLING_CONTROLS_REGRESSION
 
 FILL_NULL_COLUMN = DolphinDBFunction(
     module="query",

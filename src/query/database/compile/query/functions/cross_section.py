@@ -1,50 +1,11 @@
-"""截面算符共用的 DolphinDB 函数。"""
+"""截面算符的 DolphinDB 实现。"""
 
 from query.database.compile import DolphinDBFunction
-from query.database.compile.common.functions import IS_FINITE_NUMBER, IS_TABLE_FORM, IS_VECTOR_FORM
-
-BROADCAST_LIKE = DolphinDBFunction(
-    module="query",
-    definition="""
-def broadcast_like(value, reference) {
-    // 将标量 value 广播到与 reference 相同的长度。
-    return take(value, size(reference))
-}
-"""
-)
-
-CROSS_SECTION_RANK = DolphinDBFunction(
-    module="query",
-    definition="""
-def cross_section_rank(value, ascending, ties_method, percent) {
-    // 统一普通、密集和百分位截面排名，并将非百分位名次调整为从 1 开始。
-    if (ties_method == "dense") {
-        result = denseRank(value, ascending, true, percent)
-    } else {
-        result = rank(value, ascending, , true, ties_method, percent)
-    }
-    if (!percent) result = result + 1
-    return result
-}
-"""
-)
-
-CROSS_SECTION_SLOPE = DolphinDBFunction(
-    module="query",
-    definition="""
-def cross_section_slope(left, right) {
-    // 计算 right 关于 left 的截面 OLS 斜率；自变量无方差时返回 NULL。
-    valid = isValid(left) && isValid(right)
-    paired_left = iif(valid, double(left), double(NULL))
-    paired_right = iif(valid, double(right), double(NULL))
-    variance = covar(paired_left, paired_left)
-    return iif(
-        isNull(variance) || variance == 0,
-        double(NULL),
-        covar(paired_left, paired_right) / variance
-    )
-}
-"""
+from query.database.compile.common.functions import (
+    BROADCAST_LIKE,
+    CONTROLS_REGRESSION,
+    CROSS_SECTION_RANK,
+    CROSS_SECTION_SLOPE,
 )
 
 CS_BINARY_ALPHA = DolphinDBFunction(
@@ -388,112 +349,6 @@ CS_BINARY_RESIDUAL = DolphinDBFunction(
     }
     """,
     dependencies=(CROSS_SECTION_SLOPE,)
-)
-
-CONTROLS_REGRESSION = DolphinDBFunction(
-    module="query",
-    definition=r"""
-    def controls_regression(target, controls, intercept) {
-        /*
-        内部回归辅助函数，不登记为 DSL 算符；CS 和每个 TS 窗口共用原中性化规则。
-
-        Parameters
-        ----------
-        target : vector[NUMBER]
-            回归因变量，允许 NULL；布尔值和非数值目标不作为连续收益处理。
-        controls : table
-            与 target 等行数的解释变量表，列顺序就是调用方给定的顺序。
-            数值列直接进入设计矩阵；BOOL、STRING、SYMBOL 先独热编码，
-            各分类列按类别值升序去掉第一个水平。类别缺失不是一个类别。
-        intercept : bool
-            正常回归是否包含截距项。
-
-        Returns
-        -------
-        fit : dictionary
-            valid 为目标和全部控制共同有效的行掩码，nobs 为有效行数；
-            names/beta 按原控制列顺序排列，分类列按非基准类别升序展开。
-            数值常量列保留系数位置且系数为 0，不进入实际拟合。
-            alpha 为截距，residual 与 target 等长，无效行保留 DOUBLE NULL。
-
-        Notes
-        -----
-        数值输入的 NULL、NaN、正负无穷共同排除，分类输入只排除 NULL。
-        沿用原 CS 退化规则：无可用控制列、单样本或样本数不大于有效参数数时，
-        退化为 y-avg(y)，alpha=avg(y)、beta=0；该退化规则不受 intercept 影响。
-        正常拟合用 SVD 伪逆，秩亏列取最小范数最小二乘解；不取对数、不缩尾、不标准化。
-        分类基准只来自当前截面或当前窗口，不读取未来类别。
-        */
-        if (!is_vector_form(target) || !is_table_form(controls))
-            throw "回归 target 必须是向量，controls 必须是表"
-        n = size(target)
-        if (controls.rows() != n || controls.cols() == 0)
-            throw "回归解释变量必须与 target 等长且至少有一列"
-        if (!(type(target) in [CHAR, SHORT, INT, LONG, FLOAT, DOUBLE]))
-            throw "回归 target 必须是数值"
-        valid = is_finite_number(target)
-        for (name in controls.columnNames()) {
-            values = controls[name]
-            if (type(values) in [BOOL, SYMBOL, STRING]) valid = valid && isValid(values)
-            else valid = valid && is_finite_number(values)
-        }
-        fit = dict(STRING, ANY)
-        fit["valid"] = valid
-        fit["nobs"] = sum(valid)
-        fit["alpha"] = double(NULL)
-        fit["names"] = array(STRING, 0)
-        fit["beta"] = array(DOUBLE, 0)
-        fit["residual"] = take(double(NULL), n)
-        if (sum(valid) == 0) return fit
-        y = double(target[valid])
-        x_table = controls[valid]
-        categories = array(STRING, 0)
-        names = array(STRING, 0)
-        for (name in x_table.columnNames()) {
-            if (type(x_table[name]) in [BOOL, SYMBOL, STRING]) {
-                categories.append!(name)
-                levels = sort(distinct(x_table[name]))
-                if (size(levels) > 1) {
-                    for (j in 1 .. (size(levels) - 1))
-                        names.append!(name + "_" + string(levels[j]))
-                }
-            } else names.append!(name)
-        }
-        encoded = x_table
-        if (size(categories) > 0) encoded = oneHot(x_table, symbol(categories))
-        active = array(STRING, 0)
-        for (name in names) {
-            if (!(name in encoded.columnNames())) throw "回归分类编码列不存在：" + name
-            if (size(distinct(encoded[name])) > 1) active.append!(name)
-        }
-        beta = take(0.0, size(names))
-        alpha = avg(y)
-        residual = y - alpha
-        if (size(active) > 0 && size(y) > 1 && size(y) > size(active) + int(intercept)) {
-            design = array(ANY, 0)
-            if (intercept) design.append!(take(1.0, size(y)))
-            for (name in active) design.append!(double(encoded[name]))
-            coefficients = (pinv(matrix(design)) ** matrix(y))[0]
-            alpha = 0.0
-            if (intercept) alpha = coefficients[0]
-            fitted = take(alpha, size(y))
-            for (j in 0 .. (size(active) - 1)) {
-                position = find(names, active[j])
-                beta[position] = coefficients[j + int(intercept)]
-                fitted += beta[position] * double(encoded[active[j]])
-            }
-            residual = y - fitted
-        }
-        values = fit["residual"]
-        values[valid] = residual
-        fit["alpha"] = alpha
-        fit["names"] = names
-        fit["beta"] = beta
-        fit["residual"] = values
-        return fit
-    }
-    """,
-    dependencies=(IS_FINITE_NUMBER, IS_TABLE_FORM, IS_VECTOR_FORM),
 )
 
 CS_CONTROLS_ALPHA = DolphinDBFunction(
