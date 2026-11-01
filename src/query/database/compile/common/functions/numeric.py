@@ -165,12 +165,10 @@ CAST_VALUE = DolphinDBFunction(
         }
         if (dtype == "timestamp") {
             if (type(value) == STRING) {
-                sample = value
-                if (is_vector_form(value)) sample = value[0]
-                if (size(split(sample, ".")) > 1) {
-                    return timestamp(temporalParse(value, "yyyy-MM-ddTHH:mm:ss.SSS"))
-                }
-                return timestamp(temporalParse(value, "yyyy-MM-ddTHH:mm:ss"))
+                // 每个值独立解析秒/毫秒格式；NULL 和空向量保持原形状，不由首行决定格式。
+                precise = timestamp(temporalParse(value, "yyyy-MM-ddTHH:mm:ss.SSS"))
+                seconds = timestamp(temporalParse(value, "yyyy-MM-ddTHH:mm:ss"))
+                return nullFill(precise, seconds)
             }
             return timestamp(value)
         }
@@ -188,6 +186,158 @@ def broadcast_like(value, reference) {
     return take(value, size(reference))
 }
 """
+)
+
+ROW_REDUCTION = DolphinDBFunction(
+    module="common",
+    definition=r"""
+    def row_reduction(cols, operation, ddof=1) {
+        /*
+        对标量和等长向量组成的操作数执行逐行数值归约，不改变输入。
+
+        Parameters
+        ----------
+        cols : ANY vector
+            非空操作数列表；标量广播到向量长度，全标量输入视作单行。
+        operation : string
+            add、mean、min、max、mul、count、std 或 var。
+        ddof : int, default 1
+            std/var 的自由度修正，只允许 0 或 1。
+
+        Returns
+        -------
+        result : scalar or vector
+            全标量返回标量；其余返回等长向量，空向量返回空结果。
+
+        Notes
+        -----
+        NULL 不参与归约；全部缺失时 count 为 0，其余为 NULL。
+        方差先中心化再平方，不调用可能被 ta 模块遮蔽的 var。
+        不同长度向量拒绝计算，不能用广播掩盖输入错误。
+
+        Examples
+        --------
+        >>> row_reduction([1.0, 2.0, 3.0], "var", 1)
+        1
+        >>> row_reduction([1.0 2.0, 3.0], "add")
+        [4, 5]
+        */
+        if (size(cols) == 0) throw "逐行归约至少需要一个操作数"
+        scalar = true
+        n = 1
+        for (col in cols) {
+            if (is_vector_form(col)) {
+                if (!scalar && size(col) != n) throw "逐行归约的向量必须等长"
+                n = size(col)
+                scalar = false
+            } else if (!is_scalar_form(col)) throw "逐行归约只接受标量或向量"
+        }
+        values = array(ANY, 0)
+        for (col in cols) {
+            value = col
+            if (type(value) == VOID) value = double(NULL)
+            if (is_scalar_form(value)) value = take(value, n)
+            values.append!(value)
+        }
+        if (operation == "add") result = unifiedCall(rowSum, values)
+        else if (operation == "mean") result = unifiedCall(rowAvg, values)
+        else if (operation == "min") result = unifiedCall(rowMin, values)
+        else if (operation == "max") result = unifiedCall(rowMax, values)
+        else if (operation == "mul") result = unifiedCall(rowProd, values)
+        else if (operation == "count") result = unifiedCall(rowCount, values)
+        else if (operation in ["std", "var"]) {
+            if (!(ddof in [0, 1])) throw "方差自由度只允许 0 或 1"
+            means = unifiedCall(rowAvg, values)
+            counts = unifiedCall(rowCount, values)
+            squared = array(ANY, 0)
+            for (value in values) {
+                centered = double(value) - means
+                squared.append!(centered * centered)
+            }
+            result = iif(counts > ddof, unifiedCall(rowSum, squared) / double(counts - ddof), double(NULL))
+            if (operation == "std") result = sqrt(result)
+        } else throw "未知逐行归约：" + operation
+        if (scalar) return result[0]
+        return result
+    }
+    """,
+    dependencies=(IS_SCALAR_FORM, IS_VECTOR_FORM),
+)
+
+REPLACE_VALUES = DolphinDBFunction(
+    module="common",
+    definition=r"""
+    def replace_values(col, old, new) {
+        /*
+        按列表顺序替换，比较原始匹配值并对数值结果执行无窄化类型提升。
+
+        Parameters
+        ----------
+        col : scalar or vector
+            待替换输入，不就地修改。
+        old, new : vector
+            非空等长映射；NULL 可以作为匹配值或替换值。
+
+        Returns
+        -------
+        result : scalar or vector
+            形状与 col 相同；数值按 col/new 的最宽类型，字符串保留字符含义。
+
+        Notes
+        -----
+        替换按顺序级联；不把 old 强制转成输入类型而改变匹配关系。
+        数值与文本之间没有无损公共类型时明确报错，不静默转为 NULL。
+        NULL 匹配使用 isNull，未命中的缺失值仍为缺失。
+
+        Examples
+        --------
+        >>> replace_values(1 2 3, [1], [1.5])
+        [1.5, 2, 3]
+        >>> replace_values(1 2 3, [1.5], [0])
+        [1, 2, 3]
+        */
+        if (size(old) == 0 || size(old) != size(new)) throw "old/new 必须非空且等长"
+        numeric_types = [BOOL, CHAR, SHORT, INT, LONG, FLOAT, DOUBLE]
+        target_type = type(col)
+        numeric = target_type in numeric_types
+        text = target_type in [STRING, SYMBOL]
+        for (replacement in new) {
+            if (isNull(replacement)) continue
+            if (numeric) {
+                if (!(type(replacement) in numeric_types)) throw "数值替换值必须是数值或 NULL"
+                target_type = max(target_type, type(replacement))
+            } else if (text) {
+                if (!(type(replacement) in [STRING, SYMBOL])) throw "字符串替换值必须是字符串或 NULL"
+            } else if (type(replacement) != target_type) throw "替换值类型与输入不兼容"
+        }
+        result = cast(col, target_type)
+        replaced_at = take(-1, size(col))
+        if (is_scalar_form(col)) replaced_at = -1
+        for (i in 0 : size(old)) {
+            original = old[i]
+            if (!isNull(original)) {
+                if (numeric && !(type(original) in numeric_types)) throw "数值匹配值必须是数值或 NULL"
+                if (text && !(type(original) in [STRING, SYMBOL])) throw "字符串匹配值必须是字符串或 NULL"
+            }
+            // 输出提升不能使尚未替换的大整数在比较时先损失精度。
+            matched = isNull(col)
+            if (!isNull(original)) matched = nullFill(col == original, false)
+            matched = matched && (replaced_at == -1)
+            for (previous in 0 : i) {
+                same = isNull(new[previous]) && isNull(original)
+                if (!isNull(new[previous]) && !isNull(original)) same = new[previous] == original
+                if (same) matched = matched || (replaced_at == previous)
+            }
+            replacement = new[i]
+            if (isNull(replacement)) replacement = cast(NULL, target_type)
+            else replacement = cast(replacement, target_type)
+            result = iif(matched, replacement, result)
+            replaced_at = iif(matched, i, replaced_at)
+        }
+        return result
+    }
+    """,
+    dependencies=(IS_SCALAR_FORM,),
 )
 
 CROSS_SECTION_RANK = DolphinDBFunction(
@@ -233,6 +383,50 @@ ROLLING_MIN_PERIODS = DolphinDBFunction(
         return int(min_periods)
     }
     """
+)
+
+ROLLING_SINGLETON = DolphinDBFunction(
+    module="common",
+    definition=r"""
+    def rolling_singleton(col, operation) {
+        /*
+        处理 window=1 的滚动退化值，避免调用要求 window>=2 的移动内核。
+
+        Parameters
+        ----------
+        col : vector
+            按时间排序的单列；条件归约由算符保证为 BOOL。
+        operation : string
+            value、zero、rank、count_true、bool 或 undefined。
+
+        Returns
+        -------
+        result : vector
+            与输入等长；value 保留原类型，bool 返回 BOOL，其他结果为 DOUBLE。
+
+        Notes
+        -----
+        单观测的样本方差、标准差、相关、回归和高阶矩无定义，返回 NULL。
+        排名为 1，端点位置与 MAD 为 0；条件归约的 NULL 按 false，其余保持缺失。
+        空向量返回相同长度的空结果，不读取其他日期或证券。
+
+        Examples
+        --------
+        >>> rolling_singleton(1.0 NULL 3.0, "rank")
+        [1, NULL, 1]
+        >>> rolling_singleton(true false NULL, "count_true")
+        [1, 0, 0]
+        */
+        if (operation in ["bool", "count_true"] && type(col) != BOOL) throw "条件型算符的 col 必须是 BOOL"
+        if (operation == "value") return col
+        if (operation == "bool") return nullFill(col, false)
+        if (operation == "count_true") return double(nullFill(col, false))
+        if (operation == "zero") return iif(isNull(col), double(NULL), 0.0)
+        if (operation == "rank") return iif(isNull(col), double(NULL), 1.0)
+        if (operation == "undefined") return take(double(NULL), size(col))
+        throw "未知单观测滚动结果：" + operation
+    }
+    """,
 )
 
 MASK_EXPANDING_RESULT = DolphinDBFunction(
@@ -484,6 +678,11 @@ FILL_REGRESSION_INPUTS = DolphinDBFunction(
         if (!is_vector_form(target) || !is_table_form(controls) || controls.rows() != n || controls.cols() == 0)
             throw "回归 target 和 controls 必须等长且解释变量非空"
         config = normalize_regression_fill(fill, controls.cols())
+        if (!any(config.methods != "")) {
+            fill_regression_column(target, "", NULL, code, time, true)
+            for (name in controls.columnNames()) fill_regression_column(controls[name], "", NULL, code, time, false)
+            return dict(`target`controls, [target, controls])
+        }
         filled_target = fill_regression_column(target, config.methods[0], config.values[0], code, time, true)
         filled_controls = controls.copy()
         names = controls.columnNames()
@@ -662,6 +861,7 @@ ROLLING_TRUE_COUNT = DolphinDBFunction(
     def rolling_true_count(value, window, min_periods) {
         // 将 NULL 按 false 处理，统计每个滚动窗口中的 true 数量。
         if (type(value) != BOOL) throw "条件型算符的 col 必须是 BOOL"
+        if (window == 1) return int(nullFill(value, false))
         return msum(int(nullFill(value, false)), int(window), int(min_periods))
     }
     """

@@ -259,7 +259,7 @@ CS_BINARY_RANK_CORR = DolphinDBFunction(
         NULL 处理：先排除 left 或 right 为 NULL 的整条观测，再对同一批有效样本分别排名；
         有效配对不足时统计量为 NULL。
 
-        计算边界：并列值按 DolphinDB 默认排名处理；秩相关系数广播到整个截面。
+        计算边界：并列值使用平均秩，与 Spearman 定义一致；秩相关系数广播到整个截面。
 
         Examples
         --------
@@ -278,7 +278,9 @@ CS_BINARY_RANK_CORR = DolphinDBFunction(
         [1, 1, 1, 1, 1]
         */
         valid = isValid(left) && isValid(right)
-        value = corr(rank(left[valid]), rank(right[valid]))
+        if (sum(valid) < 2) return take(double(NULL), size(left))
+        value = corr(rank(left[valid], true, , true, `average, false),
+                     rank(right[valid], true, , true, `average, false))
         return broadcast_like(value, left)
     }
     """,

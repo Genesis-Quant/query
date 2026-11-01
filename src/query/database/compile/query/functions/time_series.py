@@ -9,6 +9,7 @@ from query.database.compile.common.functions import (
     ROLLING_CONTROLS_REGRESSION,
     ROLLING_INTERCEPT,
     ROLLING_MIN_PERIODS,
+    ROLLING_SINGLETON,
     ROLLING_SLOPE,
     ROLLING_TRUE_COUNT,
     TALIB_MOVING_AVERAGE,
@@ -708,11 +709,12 @@ TS_BINARY_ROLLING_ALPHA = DolphinDBFunction(
         >>> ts_binary_rolling_alpha(left, right, 4, 2)
         [NULL, 1.16667, 1.21429, 1.17333, 1.075, 1.37333, 1.15, 2.19231]
         */
+        if (window == 1) return rolling_singleton(left, "undefined")
         minimum = rolling_min_periods(window, min_periods)
         return rolling_intercept(left, right, window, minimum)
     }
     """,
-    dependencies=(ROLLING_INTERCEPT, ROLLING_MIN_PERIODS)
+    dependencies=(ROLLING_INTERCEPT, ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_BINARY_ROLLING_BETA = DolphinDBFunction(
@@ -771,11 +773,12 @@ TS_BINARY_ROLLING_BETA = DolphinDBFunction(
         >>> ts_binary_rolling_beta(left, right, 4, 2)
         [NULL, 0.333333, 0.428571, 0.453333, 0.6, 0.586667, 0.7, 0.538462]
         */
+        if (window == 1) return rolling_singleton(left, "undefined")
         minimum = rolling_min_periods(window, min_periods)
         return rolling_slope(left, right, window, minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SLOPE)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SLOPE, ROLLING_SINGLETON)
 )
 
 TS_BINARY_ROLLING_CORR = DolphinDBFunction(
@@ -832,11 +835,12 @@ TS_BINARY_ROLLING_CORR = DolphinDBFunction(
         >>> ts_binary_rolling_corr(left, right, 4, 2)
         [NULL, 1, 0.654654, 0.877876, 0.641427, 0.803326, 0.52915, 0.868243]
         */
+        if (window == 1) return rolling_singleton(left, "undefined")
         minimum = rolling_min_periods(window, min_periods)
         return mcorr(left, right, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_BINARY_ROLLING_COV = DolphinDBFunction(
@@ -893,11 +897,12 @@ TS_BINARY_ROLLING_COV = DolphinDBFunction(
         >>> ts_binary_rolling_cov(left, right, 4, 2)
         [NULL, 0.375, 0.25, 0.708333, 0.5, 0.916667, 0.291667, 0.583333]
         */
+        if (window == 1) return rolling_singleton(left, "undefined")
         minimum = rolling_min_periods(window, min_periods)
         return mcovar(left, right, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_BINARY_ROLLING_RESIDUAL = DolphinDBFunction(
@@ -956,13 +961,14 @@ TS_BINARY_ROLLING_RESIDUAL = DolphinDBFunction(
         >>> ts_binary_rolling_residual(left, right, 4, 2)
         [NULL, 0, 0.428571, 0.0133333, 0.825, 0.193333, 0.7, 0.0769231]
         */
+        if (window == 1) return rolling_singleton(left, "undefined")
         minimum = rolling_min_periods(window, min_periods)
         slope = rolling_slope(left, right, window, minimum)
         intercept = rolling_intercept(left, right, window, minimum)
         return right - intercept - slope * left
     }
     """,
-    dependencies=(ROLLING_INTERCEPT, ROLLING_MIN_PERIODS, ROLLING_SLOPE)
+    dependencies=(ROLLING_INTERCEPT, ROLLING_MIN_PERIODS, ROLLING_SLOPE, ROLLING_SINGLETON)
 )
 
 TS_TALIB_AD = DolphinDBFunction(
@@ -4504,11 +4510,13 @@ TS_UNARY_DECAY_LINEAR = DolphinDBFunction(
         >>> ts_unary_decay_linear(1.0 NULL 4.0 3.0 5.0, 3, 2)
         [NULL, NULL, 3.25, 3.4, 4.16667]
         */
+        if (window > 1024) throw "线性衰减窗口最多为 1024"
+        if (window == 1) return rolling_singleton(col, "value")
         minimum = rolling_min_periods(window, min_periods)
         return mavg(col, double(1..int(window)), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_DIFF = DolphinDBFunction(
@@ -5476,13 +5484,14 @@ TS_UNARY_ROLLING_ALL = DolphinDBFunction(
         >>> ts_unary_rolling_all(col, 4, 2)
         [false, false, false, false, false, false, false, false]
         */
+        if (window == 1) return rolling_singleton(col, "bool")
         minimum = rolling_min_periods(window, min_periods)
         count_true = rolling_true_count(col, window, minimum)
         count_valid = mcount(col, int(window), minimum)
         return (count_valid >= minimum) && (count_true == count_valid)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS, ROLLING_TRUE_COUNT)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_TRUE_COUNT, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_ANY = DolphinDBFunction(
@@ -5536,11 +5545,12 @@ TS_UNARY_ROLLING_ANY = DolphinDBFunction(
         >>> ts_unary_rolling_any(col, 4, 2)
         [false, true, true, true, true, true, true, true]
         */
+        if (window == 1) return rolling_singleton(col, "bool")
         minimum = rolling_min_periods(window, min_periods)
         return rolling_true_count(col, window, minimum) > 0
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS, ROLLING_TRUE_COUNT)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_TRUE_COUNT, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_ARGMAX = DolphinDBFunction(
@@ -5594,11 +5604,12 @@ TS_UNARY_ROLLING_ARGMAX = DolphinDBFunction(
         >>> ts_unary_rolling_argmax(col, 4, 2)
         [NULL, 1, 2, 2, 3, 3, 2, 3]
         */
+        if (window == 1) return rolling_singleton(col, "zero")
         minimum = rolling_min_periods(window, min_periods)
         return mimax(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_ARGMIN = DolphinDBFunction(
@@ -5652,11 +5663,12 @@ TS_UNARY_ROLLING_ARGMIN = DolphinDBFunction(
         >>> ts_unary_rolling_argmin(col, 4, 2)
         [NULL, 0, 0, 0, 0, 1, 0, 0]
         */
+        if (window == 1) return rolling_singleton(col, "zero")
         minimum = rolling_min_periods(window, min_periods)
         return mimin(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_COUNT = DolphinDBFunction(
@@ -5768,11 +5780,12 @@ TS_UNARY_ROLLING_FIRST = DolphinDBFunction(
         >>> ts_unary_rolling_first(col, 4, 2)
         [NULL, 1, 1, 1, 2, 4, 3, 5]
         */
+        if (window == 1) return rolling_singleton(col, "value")
         minimum = rolling_min_periods(window, min_periods)
         return mfirst(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_KURT = DolphinDBFunction(
@@ -5826,11 +5839,12 @@ TS_UNARY_ROLLING_KURT = DolphinDBFunction(
         >>> ts_unary_rolling_kurt(col, 4, 2)
         [NULL, NULL, 1.5, 1.64, 1.64, 1.84571, 1.84571, 1.64]
         */
+        if (window == 1) return rolling_singleton(col, "undefined")
         minimum = rolling_min_periods(window, min_periods)
         return mkurtosis(col, int(window), true, minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_LAST = DolphinDBFunction(
@@ -5884,11 +5898,12 @@ TS_UNARY_ROLLING_LAST = DolphinDBFunction(
         >>> ts_unary_rolling_last(col, 4, 2)
         [NULL, 2, 4, 3, 5, 7, 6, 8]
         */
+        if (window == 1) return rolling_singleton(col, "value")
         minimum = rolling_min_periods(window, min_periods)
         return mlast(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_MAD = DolphinDBFunction(
@@ -5944,11 +5959,12 @@ TS_UNARY_ROLLING_MAD = DolphinDBFunction(
         >>> ts_unary_rolling_mad(col, 4, 2)
         [NULL, 0.5, 1, 1, 1, 1, 1, 1]
         */
+        if (window == 1) return rolling_singleton(col, "zero")
         minimum = rolling_min_periods(window, min_periods)
         return mmad(col, int(window), true, minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_MAX = DolphinDBFunction(
@@ -6002,11 +6018,12 @@ TS_UNARY_ROLLING_MAX = DolphinDBFunction(
         >>> ts_unary_rolling_max(col, 4, 2)
         [NULL, 2, 4, 4, 5, 7, 7, 8]
         */
+        if (window == 1) return rolling_singleton(col, "value")
         minimum = rolling_min_periods(window, min_periods)
         return mmax(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_MEAN = DolphinDBFunction(
@@ -6060,11 +6077,12 @@ TS_UNARY_ROLLING_MEAN = DolphinDBFunction(
         >>> ts_unary_rolling_mean(col, 4, 2)
         [NULL, 1.5, 2.33333, 2.5, 3.5, 4.75, 5.25, 6.5]
         */
+        if (window == 1) return rolling_singleton(col, "value")
         minimum = rolling_min_periods(window, min_periods)
         return mavg(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_MEDIAN = DolphinDBFunction(
@@ -6118,11 +6136,12 @@ TS_UNARY_ROLLING_MEDIAN = DolphinDBFunction(
         >>> ts_unary_rolling_median(col, 4, 2)
         [NULL, 1.5, 2, 2.5, 3.5, 4.5, 5.5, 6.5]
         */
+        if (window == 1) return rolling_singleton(col, "value")
         minimum = rolling_min_periods(window, min_periods)
         return mmed(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_MIN = DolphinDBFunction(
@@ -6176,11 +6195,12 @@ TS_UNARY_ROLLING_MIN = DolphinDBFunction(
         >>> ts_unary_rolling_min(col, 4, 2)
         [NULL, 1, 1, 1, 2, 3, 3, 5]
         */
+        if (window == 1) return rolling_singleton(col, "value")
         minimum = rolling_min_periods(window, min_periods)
         return mmin(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_PROD = DolphinDBFunction(
@@ -6234,11 +6254,12 @@ TS_UNARY_ROLLING_PROD = DolphinDBFunction(
         >>> ts_unary_rolling_prod(col, 4, 2)
         [NULL, 2, 8, 24, 120, 420, 630, 1680]
         */
+        if (window == 1) return rolling_singleton(col, "value")
         minimum = rolling_min_periods(window, min_periods)
         return mprod(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_QUANTILE = DolphinDBFunction(
@@ -6302,11 +6323,12 @@ TS_UNARY_ROLLING_QUANTILE = DolphinDBFunction(
         >>> ts_unary_rolling_quantile(col, 3, 2, 0.75)
         [NULL, 1.75, 3, 3.5, 4.5, 6, 6.5, 7.5]
         */
+        if (window == 1) return rolling_singleton(col, "value")
         minimum = rolling_min_periods(window, min_periods)
         return mpercentile(col, 100 * q, int(window), "linear", minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_RANK = DolphinDBFunction(
@@ -6381,13 +6403,14 @@ TS_UNARY_ROLLING_RANK = DolphinDBFunction(
         >>> ts_unary_rolling_rank(1.0 NULL 2.0 2.0 3.0, 3, 2, true, "average")
         [NULL, NULL, 2, 1.5, 3]
         */
+        if (window == 1) return rolling_singleton(col, "rank")
         minimum = rolling_min_periods(window, min_periods)
         result = mrank(col, ascending, int(window), true, ties_method, false, minimum)
         if (!false) result = result + 1
         return result
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_RANK_PCT = DolphinDBFunction(
@@ -6462,13 +6485,14 @@ TS_UNARY_ROLLING_RANK_PCT = DolphinDBFunction(
         >>> ts_unary_rolling_rank_pct(1.0 NULL 2.0 2.0 3.0, 3, 2, true, "average")
         [NULL, NULL, 1, 0.75, 1]
         */
+        if (window == 1) return rolling_singleton(col, "rank")
         minimum = rolling_min_periods(window, min_periods)
         result = mrank(col, ascending, int(window), true, ties_method, true, minimum)
         if (!true) result = result + 1
         return result
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_SEM = DolphinDBFunction(
@@ -6522,11 +6546,12 @@ TS_UNARY_ROLLING_SEM = DolphinDBFunction(
         >>> ts_unary_rolling_sem(col, 4, 2)
         [NULL, 0.5, 0.881917, 0.645497, 0.645497, 0.853913, 0.853913, 0.645497]
         */
+        if (window == 1) return rolling_singleton(col, "undefined")
         minimum = rolling_min_periods(window, min_periods)
         return mstd(col, int(window), minimum) / sqrt(mcount(col, int(window), minimum))
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_SKEW = DolphinDBFunction(
@@ -6580,11 +6605,12 @@ TS_UNARY_ROLLING_SKEW = DolphinDBFunction(
         >>> ts_unary_rolling_skew(col, 4, 2)
         [NULL, 0, 0.381802, 0, 0, 0.434651, -0.434651, 0]
         */
+        if (window == 1) return rolling_singleton(col, "undefined")
         minimum = rolling_min_periods(window, min_periods)
         return mskew(col, int(window), true, minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_STD = DolphinDBFunction(
@@ -6638,11 +6664,12 @@ TS_UNARY_ROLLING_STD = DolphinDBFunction(
         >>> ts_unary_rolling_std(col, 4, 2)
         [NULL, 0.707107, 1.52753, 1.29099, 1.29099, 1.70783, 1.70783, 1.29099]
         */
+        if (window == 1) return rolling_singleton(col, "undefined")
         minimum = rolling_min_periods(window, min_periods)
         return mstd(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_SUM = DolphinDBFunction(
@@ -6696,11 +6723,12 @@ TS_UNARY_ROLLING_SUM = DolphinDBFunction(
         >>> ts_unary_rolling_sum(col, 4, 2)
         [NULL, 3, 7, 10, 14, 19, 21, 26]
         */
+        if (window == 1) return rolling_singleton(col, "value")
         minimum = rolling_min_periods(window, min_periods)
         return msum(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_TRUE_COUNT = DolphinDBFunction(
@@ -6754,11 +6782,12 @@ TS_UNARY_ROLLING_TRUE_COUNT = DolphinDBFunction(
         >>> ts_unary_rolling_true_count(col, 4, 2)
         [NULL, 1, 2, 2, 3, 3, 3, 3]
         */
+        if (window == 1) return rolling_singleton(col, "count_true")
         minimum = rolling_min_periods(window, min_periods)
         return rolling_true_count(col, window, minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS, ROLLING_TRUE_COUNT)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_TRUE_COUNT, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_VAR = DolphinDBFunction(
@@ -6812,11 +6841,12 @@ TS_UNARY_ROLLING_VAR = DolphinDBFunction(
         >>> ts_unary_rolling_var(col, 4, 2)
         [NULL, 0.5, 2.33333, 1.66667, 1.66667, 2.91667, 2.91667, 1.66667]
         */
+        if (window == 1) return rolling_singleton(col, "undefined")
         minimum = rolling_min_periods(window, min_periods)
         return mvar(col, int(window), minimum)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_ROLLING_ZSCORE = DolphinDBFunction(
@@ -6869,12 +6899,13 @@ TS_UNARY_ROLLING_ZSCORE = DolphinDBFunction(
         >>> ts_unary_rolling_zscore(col, 4, 2)
         [NULL, 0.707107, 1.09109, 0.387298, 1.1619, 1.31747, 0.439155, 1.1619]
         */
+        if (window == 1) return rolling_singleton(col, "undefined")
         minimum = rolling_min_periods(window, min_periods)
         scale = mstd(col, int(window), minimum)
         return iif(scale == 0, NULL, (col - mavg(col, int(window), minimum)) / scale)
     }
     """,
-    dependencies=(ROLLING_MIN_PERIODS,)
+    dependencies=(ROLLING_MIN_PERIODS, ROLLING_SINGLETON)
 )
 
 TS_UNARY_SHIFT = DolphinDBFunction(

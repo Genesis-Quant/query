@@ -273,9 +273,10 @@ APPLY_ROLLING_OLS = DolphinDBFunction(
         selected = select * from selected order by code, time, row_id
         input_target = target
         input_controls = controls
-        if (type(fill) != VOID && selected.rows() > 0) {
+        fill_config = normalize_regression_fill(fill, controls.cols())
+        if (any(fill_config.methods != "") && selected.rows() > 0) {
             indices = selected.row_id
-            filled = fill_regression_inputs(target[indices], controls[indices], code[indices], time[indices], fill)
+            filled = fill_regression_inputs(target[indices], controls[indices], code[indices], time[indices], fill_config)
             input_target = take(double(NULL), n)
             input_target[indices] = filled.target
             input_controls = controls.copy()
@@ -519,7 +520,9 @@ BUILD_DEFAULT_FACTOR_SOURCE = DolphinDBFunction(
               and time < end_time
               and factor in symbol(factors)
               and code in symbol(codes)
-        events = select time, code, false as selected from values
+        // 正式日期已有完整证券面板；只补入去重后的额外事件键，保留非交易日事件。
+        events = select distinct time, code, false as selected from values
+            where !(time in timestamp(dates))
         timeline = select max(selected) as selected
             from unionAll(universe, events)
             group by time, code

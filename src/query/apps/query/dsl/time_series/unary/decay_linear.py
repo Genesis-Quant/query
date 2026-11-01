@@ -15,7 +15,7 @@ from query.apps.query.dsl.types import (
 class TimeSeriesUnaryDecayLinearParams(StrictModel):
     """unary.decay_linear 参数。"""
 
-    window: int = Field(..., ge=1, description="on=true 序列中的窗口长度。")
+    window: int = Field(..., ge=1, le=1024, description="on=true 序列中的窗口长度；显式线性权重最多 1024 项。")
     min_periods: int | None = Field(default=None, ge=1, description="产生结果所需的最少非空观测数。")
 
     @model_validator(mode="after")

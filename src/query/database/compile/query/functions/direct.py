@@ -6,6 +6,8 @@ from query.database.compile.common.functions import (
     DIVIDE_OR_NULL,
     FLOOR_AS_DOUBLE,
     IS_FINITE_NUMBER,
+    REPLACE_VALUES,
+    ROW_REDUCTION,
 )
 
 DIRECT_BINARY_ADD = DolphinDBFunction(
@@ -963,9 +965,10 @@ DIRECT_MULTIARY_ADD = DolphinDBFunction(
         >>> direct_multiary_add(cols)
         [11, 20, 3]
         */
-        return unifiedCall(rowSum, cols)
+        return row_reduction(cols, "add")
     }
-    """
+    """,
+    dependencies=(ROW_REDUCTION,),
 )
 
 DIRECT_MULTIARY_AND = DolphinDBFunction(
@@ -1109,9 +1112,10 @@ DIRECT_MULTIARY_COUNT = DolphinDBFunction(
         >>> direct_multiary_count([double([1, NULL, NULL]), double([4, 5, NULL])])
         [2, 1, 0]
         */
-        return unifiedCall(rowCount, cols)
+        return row_reduction(cols, "count")
     }
-    """
+    """,
+    dependencies=(ROW_REDUCTION,),
 )
 
 DIRECT_MULTIARY_MAX = DolphinDBFunction(
@@ -1161,9 +1165,10 @@ DIRECT_MULTIARY_MAX = DolphinDBFunction(
         >>> direct_multiary_max(cols)
         [10, 20, 3]
         */
-        return unifiedCall(rowMax, cols)
+        return row_reduction(cols, "max")
     }
-    """
+    """,
+    dependencies=(ROW_REDUCTION,),
 )
 
 DIRECT_MULTIARY_MEAN = DolphinDBFunction(
@@ -1213,9 +1218,10 @@ DIRECT_MULTIARY_MEAN = DolphinDBFunction(
         >>> direct_multiary_mean(cols)
         [5.5, 20, 3]
         */
-        return unifiedCall(rowAvg, cols)
+        return row_reduction(cols, "mean")
     }
-    """
+    """,
+    dependencies=(ROW_REDUCTION,),
 )
 
 DIRECT_MULTIARY_MIN = DolphinDBFunction(
@@ -1265,9 +1271,10 @@ DIRECT_MULTIARY_MIN = DolphinDBFunction(
         >>> direct_multiary_min(cols)
         [1, 20, 3]
         */
-        return unifiedCall(rowMin, cols)
+        return row_reduction(cols, "min")
     }
-    """
+    """,
+    dependencies=(ROW_REDUCTION,),
 )
 
 DIRECT_MULTIARY_MUL = DolphinDBFunction(
@@ -1317,9 +1324,10 @@ DIRECT_MULTIARY_MUL = DolphinDBFunction(
         >>> direct_multiary_mul(cols)
         [10, 20, 3]
         */
-        return unifiedCall(rowProd, cols)
+        return row_reduction(cols, "mul")
     }
-    """
+    """,
+    dependencies=(ROW_REDUCTION,),
 )
 
 DIRECT_MULTIARY_OR = DolphinDBFunction(
@@ -1416,32 +1424,10 @@ DIRECT_MULTIARY_STD = DolphinDBFunction(
         >>> direct_multiary_std(cols, 1)
         [6.36396, 12.7279, 19.0919]
         */
-        if (all(each(form, cols) == SCALAR)) {
-            if (int(ddof) == 1) return std(cols)
-            return stdp(cols)
-        }
-        means = unifiedCall(rowAvg, cols)
-        counts = unifiedCall(rowCount, cols)
-        denominator = counts - int(ddof)
-        centered = eachLeft(sub, cols, means)
-
-        // 先中心化再平方，避免 rowStd/rowStdp 对极小差值发生消减误差。
-        if (form(means) == SCALAR) {
-            variance = iif(
-                denominator > 0,
-                sum(centered * centered) / denominator,
-                NULL
-            )
-            return sqrt(variance)
-        }
-        variance = iif(
-            denominator > 0,
-            rowSum(centered * centered) / denominator,
-            NULL
-        )
-        return sqrt(variance)
+        return row_reduction(cols, "std", int(ddof))
     }
-    """
+    """,
+    dependencies=(ROW_REDUCTION,),
 )
 
 DIRECT_MULTIARY_VAR = DolphinDBFunction(
@@ -1488,30 +1474,10 @@ DIRECT_MULTIARY_VAR = DolphinDBFunction(
         >>> direct_multiary_var(cols, 1)
         [40.5, 162, 364.5]
         */
-        if (all(each(form, cols) == SCALAR)) {
-            if (int(ddof) == 1) return var(cols)
-            return varp(cols)
-        }
-        means = unifiedCall(rowAvg, cols)
-        counts = unifiedCall(rowCount, cols)
-        denominator = counts - int(ddof)
-        centered = eachLeft(sub, cols, means)
-
-        // 先中心化再平方，避免 rowVar/rowVarp 对极小差值发生消减误差。
-        if (form(means) == SCALAR) {
-            return iif(
-                denominator > 0,
-                sum(centered * centered) / denominator,
-                NULL
-            )
-        }
-        return iif(
-            denominator > 0,
-            rowSum(centered * centered) / denominator,
-            NULL
-        )
+        return row_reduction(cols, "var", int(ddof))
     }
-    """
+    """,
+    dependencies=(ROW_REDUCTION,),
 )
 
 DIRECT_NULLARY_FALSE = DolphinDBFunction(
@@ -3052,7 +3018,8 @@ DIRECT_UNARY_REPLACE = DolphinDBFunction(
         NULL 处理：未被 old 明确匹配的 NULL 保持为 NULL；替换按 old/new
         的对应顺序依次执行，后一次替换会看到前一次替换的结果。
 
-        形状与类型：输出保持输入长度。old 与 new 必须一一对应，替换值可能触发 DolphinDB 的公共类型提升。
+        形状与类型：输出保持输入长度；old 不按输入类型窄化。数值结果按输入与 new 的最宽类型提升，
+        文本和数值之间没有无损公共类型时明确报错，不静默转成 NULL。
 
         Examples
         --------
@@ -3075,20 +3042,10 @@ DIRECT_UNARY_REPLACE = DolphinDBFunction(
         >>> direct_unary_replace(col, double(NULL), 0.0)
         [1, 0, 3]
         */
-        result = col
-        target_type = type(col)
-        for (index in 0..(size(old) - 1)) {
-            old_value = old[index]
-            new_value = new[index]
-            if (target_type != SYMBOL) {
-                old_value = cast(old_value, target_type)
-                new_value = cast(new_value, target_type)
-            }
-            result = replace(result, old_value, new_value)
-        }
-        return result
+        return replace_values(col, old, new)
     }
-    """
+    """,
+    dependencies=(REPLACE_VALUES,),
 )
 
 DIRECT_UNARY_ROUND = DolphinDBFunction(
