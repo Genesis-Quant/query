@@ -1,10 +1,12 @@
-"""为惰性结果对象提供 DolphinDB 会话生命周期与按需下载。"""
+"""为惰性结果提供已有会话上的按需读取和结果生命周期。"""
 
 from typing import Any, Self
 
+from .logging import logger
+
 
 class SessionResult:
-    """持有一个会话，并执行任意 DolphinDB 脚本下载结果。"""
+    """借用已有会话执行读取，不管理会话生命周期。"""
 
     def __init__(
         self,
@@ -26,10 +28,7 @@ class SessionResult:
         return self.session.run(script)
 
     def close(self) -> None:
-        """关闭结果持有的 DolphinDB 会话；重复调用是安全的。"""
-        if self.closed:
-            return
-        self.session.close()
+        """标记结果关闭，不关闭调用方提供的会话。"""
         self.closed = True
 
     def __enter__(self) -> Self:
@@ -44,8 +43,13 @@ class SessionResult:
         exception: BaseException | None,
         traceback: Any,
     ) -> bool:
-        """退出上下文时关闭 DolphinDB 会话。"""
-        self.close()
+        """退出时回收结果，清理失败不覆盖with块内的原始异常。"""
+        try:
+            self.close()
+        except Exception as error:
+            if exception_type is None:
+                raise
+            logger.warning(f"异常退出时关闭结果失败：{type(error).__name__}")
         return False
 
 

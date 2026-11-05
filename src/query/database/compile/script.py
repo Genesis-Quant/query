@@ -1,9 +1,12 @@
 """按依赖顺序编译可直接在 session 中运行的 DolphinDB 函数。"""
 
+import json
 from collections.abc import Iterable
+from functools import cache
 from pathlib import Path
 
-from .function import DolphinDBFunction
+from .functions import QUERY_FUNCTIONS
+from .functions.function import DolphinDBFunction
 
 
 def collect_functions(
@@ -44,7 +47,7 @@ def render_functions(functions: Iterable[DolphinDBFunction]) -> str:
     return f"{definitions}\n" if definitions else ""
 
 
-def build_script(
+def compile_functions(
     module: str,
     functions: Iterable[DolphinDBFunction],
     *,
@@ -60,9 +63,72 @@ def build_script(
     return "\n\n".join(statements).rstrip() + "\n"
 
 
-def write_script(module: str, script: str, *, output_dir: Path) -> Path:
-    path = output_dir / f"{module}.dos"
+QUERY_SCRIPT = r"""
+def buildQuery(request) {
+    sourceTable = loadTable(request.database, request.table)
+    calendar = exec distinct timestamp(date(time)) from sourceTable
+        where factor = `close, time >= request.start, time < request.end
+        order by timestamp(date(time))
+    if (size(calendar) == 0) throw "查询区间没有交易日历"
+
+    timeline = calendar
+    for (column in request.weights) {
+        observedDates = exec distinct timestamp(time) from sourceTable
+            where factor = symbol([column])[0], time >= request.start, time < request.end
+        timeline = sort(distinct(timeline join observedDates))
+    }
+    source = build_factor_source(
+        sourceTable,
+        request.codes,
+        request.factors,
+        timeline,
+        request.start,
+        request.end
+    )
+    source[`selected] = source.time in calendar
+
+    for (column in request.factors) {
+        if (column == request.st) {
+            source = fill_null_column(source, column, 0.0)
+        } else if (column in request.weights) {
+            observedDates = exec distinct timestamp(time) from sourceTable
+                where factor = symbol([column])[0], time >= request.start, time < request.end
+            source[column] = iif(
+                source.time in observedDates,
+                nullFill(source[column], 0.0),
+                source[column]
+            )
+            source = forward_fill_column(source, column, source.code, source.time)
+        } else if (column in request.financial || column in request.industry) {
+            source = forward_fill_column(source, column, source.code, source.time)
+        }
+    }
+    source = finalize_factor_source(source, request.factors)
+    computed = compute_factors(source, fromStdJson(request.definitions))
+    filtered = filter_factors(computed, request.filters)
+    data = project_factor_output(filtered, request.columns, request.outputStart, request.outputEnd)
+    calendar = calendar[calendar >= request.outputStart && calendar < request.outputEnd]
+    return dict(`source`computed`filtered`data`calendar, [source, computed, filtered, data, calendar])
+}
+"""
+
+
+@cache
+def build_script() -> str:
+    """编译查询函数及其依赖，供调用方显式初始化已有会话。"""
+    from query.workers.core.industry import INDUSTRY_FACTORS
+    from query.workers.core.stock_financial import FINANCIAL_FACTORS
+
+    source = compile_functions("query", QUERY_FUNCTIONS, uses=("ta",)) + "\n" + QUERY_SCRIPT
+    return source.replace("__FINANCIAL_FACTORS__", json.dumps(sorted(FINANCIAL_FACTORS))).replace(
+        "__INDUSTRY_FACTORS__", json.dumps(list(INDUSTRY_FACTORS))
+    )
+
+
+def write_script(*, output_dir: Path = Path("output")) -> Path:
+    path = output_dir / "query.dos"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists() or path.read_text(encoding="utf-8") != script:
-        path.write_text(script, encoding="utf-8", newline="\n")
+    source = build_script()
+    if not path.exists() or path.read_text(encoding="utf-8") != source:
+        path.write_text(source, encoding="utf-8", newline="\n")
     return path

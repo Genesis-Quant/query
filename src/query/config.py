@@ -1,48 +1,93 @@
-"""独立查询与数据更新配置；导入库时不读取 .env、不访问网络。"""
+"""查询、CoreData Worker 和 Barra Worker 的统一配置。"""
 
 import os
+from pathlib import Path
 
-from pydantic import SecretStr
+from dotenv import load_dotenv
 
-from .settings import DolphinSettings
+load_dotenv(Path.cwd() / ".env")
 
-INDEX_CODES = tuple(filter(None, map(str.strip, os.getenv(
-    "INDEX_CODES", "000016.SH,000300.SH,000905.SH,000852.SH"
-).split(","))))
+INDEX_CODES = tuple(
+    code.strip() for code in os.getenv(
+        "INDEX_CODES", "000016.SH,000300.SH,000905.SH,000852.SH,000985.CSI"
+    ).split(",") if code.strip()
+)
 DATA_START_DATE = os.getenv("DATA_START_DATE", "2010-01-01")
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN")
 
 
-class WorkerSettings:
-    """原 Worker 写入器配置，读写凭据严格分离。"""
+class DolphinSettings:
+    """查询及写入目标表位置，不包含连接端点或账号凭据。"""
+    core_database = os.getenv("DOLPHIN_CORE_DATABASE", "dfs://CoreData")
+    core_table = os.getenv("DOLPHIN_CORE_TABLE", "coreTable")
+    barra_database = os.getenv("DOLPHIN_BARRA_DATABASE", "dfs://Barra")
+    barra_table = os.getenv("DOLPHIN_BARRA_TABLE", "barra")
+    barra_cov_table = os.getenv("DOLPHIN_BARRA_COV_TABLE", "barraCov")
+    barra_sp_table = os.getenv("DOLPHIN_BARRA_SP_TABLE", "barraSp")
+    snapshot_database = os.getenv("DOLPHIN_SNAPSHOT_DATABASE", "dfs://StockSnapshot")
+    snapshot_table = os.getenv("DOLPHIN_SNAPSHOT_TABLE", "snapshot")
 
-    ENDPOINTS = DolphinSettings.environment_endpoints()
-    HOST = ENDPOINTS[0].rsplit(":", 1)[0].strip("[]")
-    PORT = int(ENDPOINTS[0].rsplit(":", 1)[1])
-    DATABASE = os.getenv("DOLPHIN_CORE_DATABASE", "dfs://CoreData")
-    TABLE = os.getenv("DOLPHIN_CORE_TABLE", "coreTable")
-    RUNTIME_USERNAME = os.getenv("DOLPHINDB_USERNAME") or os.getenv("DOLPHIN_RUNTIME_USERNAME")
-    RUNTIME_PASSWORD = os.getenv("DOLPHINDB_PASSWORD") or os.getenv("DOLPHIN_RUNTIME_PASSWORD")
-    WORKER_USERNAME = os.getenv("DOLPHINDB_WORKER_USERNAME") or os.getenv("DOLPHIN_WORKER_USERNAME")
-    WORKER_PASSWORD = os.getenv("DOLPHINDB_WORKER_PASSWORD") or os.getenv("DOLPHIN_WORKER_PASSWORD")
-    HIGH_AVAILABILITY = False
-    HIGH_AVAILABILITY_SITES = ENDPOINTS[1:]
-    USE_PUBLIC_NAME = False
 
-    @classmethod
-    def credentials(cls, role: str) -> tuple[str, str]:
-        if role == "runtime":
-            username, password = cls.RUNTIME_USERNAME, cls.RUNTIME_PASSWORD
-        elif role == "worker":
-            username, password = cls.WORKER_USERNAME, cls.WORKER_PASSWORD
-        else:
-            raise ValueError(f"未知 DolphinDB 账号角色：{role}")
-        if not username or not password:
-            raise RuntimeError(f"缺少 DolphinDB {role} 专用账号配置")
-        return username, password
+class WorkerSettings(DolphinSettings):
+    """独立Query命令行更新所需的SDK连接配置，不供查询API建连。"""
 
-    @classmethod
-    def session_settings(cls, role: str) -> DolphinSettings:
-        username, password = cls.credentials(role)
-        return DolphinSettings(endpoints=cls.ENDPOINTS, username=username,
-                              password=SecretStr(password), database=cls.DATABASE, table=cls.TABLE)
+    endpoints = tuple(
+        endpoint.strip() for endpoint in os.getenv(
+            "DOLPHINDB_ENDPOINTS",
+            f"{os.getenv('DOLPHIN_HOST', 'dolphindb')}:{os.getenv('DOLPHIN_PORT', '8848')}",
+        ).split(",") if endpoint.strip()
+    )
+    username = os.getenv("DOLPHINDB_USERNAME") or os.getenv("DOLPHIN_RUNTIME_USERNAME")
+    worker_username = os.getenv("DOLPHINDB_WORKER_USERNAME") or os.getenv("DOLPHIN_WORKER_USERNAME")
+    worker_password = os.getenv("DOLPHINDB_WORKER_PASSWORD") or os.getenv("DOLPHIN_WORKER_PASSWORD")
+
+
+class BarraConfig:
+    """教程因子关系及已确认的日频参数；同样直接传递配置类。"""
+
+    benchmark = "000985.CSI"
+    industry_level = 1
+    financial_page_size = 10_000
+    first_factors = {
+        "Quality": ["Earnings_Quality", "Earnings_Variability", "Investment_Quality",
+                    "Leverage", "Profitability"],
+        "Value": ["Btop", "Earning_Yield", "Long_Term_Reversal"],
+        "Growth": ["Growth"],
+        "Liquidity": ["Liquidity"],
+        "Volatility": ["Beta", "Residual_Volatility"],
+        "Size": ["Size", "Mid_Cap"],
+        "Momentum": ["Momentum"],
+        "Dividend_Yield": ["Dividend_Yield"],
+    }
+    second_factors = {
+        "Earnings_Quality": ["abs", "acf_ttm"],
+        "Earnings_Variability": ["vsal_ttm", "vern_ttm", "vflo_ttm"],
+        "Investment_Quality": ["agro", "igro", "cxgro"],
+        "Leverage": ["mlev", "dtoa", "blev"],
+        "Profitability": ["ato_ttm", "gp_ttm", "gpm_ttm", "roa_ttm"],
+        "Btop": ["btop"],
+        "Earning_Yield": ["cetop_ttm", "etop_ttm", "em"],
+        "Long_Term_Reversal": ["ltrstr", "lthalpha"],
+        "Growth": ["egro_ttm", "sgro_ttm"],
+        "Liquidity": ["stom", "stoq", "stoa", "atvr"],
+        "Beta": ["hbeta"],
+        "Residual_Volatility": ["hsigma", "dastd", "cmra"],
+        "Size": ["lncap"],
+        "Mid_Cap": ["midcap"],
+        "Momentum": ["rstr", "halpha"],
+        "Dividend_Yield": ["dtop"],
+    }
+    styles = tuple(first_factors)
+    covariance_window = 252
+    specific_window = 252
+    covariance_half_life = 63.0
+    specific_half_life = 63.0
+    newey_west_lags = 5
+    specific_shrinkage = True
+    eigen_adjustment = False
+    min_listing_days = 60
+    min_specific_observations = 60
+    variance_floor = 1e-8
+    history_years = 6
+    report_years = 2
+    price_window = 1324

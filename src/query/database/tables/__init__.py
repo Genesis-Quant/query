@@ -1,5 +1,6 @@
-"""只提供 time/code/factor/value 因子窄表。"""
+"""CoreData因子窄表和独立Barra风险结果表。"""
 
+from .barra import BarraTableWriter
 from .core import CORE_TABLE, CoreTableWriter
 
-__all__ = ["CORE_TABLE", "CoreTableWriter"]
+__all__ = ["CORE_TABLE", "CoreTableWriter", "BarraTableWriter"]

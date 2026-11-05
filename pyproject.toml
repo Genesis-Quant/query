@@ -1,8 +1,7 @@
 [project]
 name = "query"
-version = "0.1.5"
+version = "0.1.6"
 description = "Standalone DolphinDB query DSL and incremental market-data workers."
-readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "dolphindb>=3.0.4.2",
@@ -16,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-query = "query.manage:main"
+query = "query.__main__:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<9", "ruff>=0.16"]

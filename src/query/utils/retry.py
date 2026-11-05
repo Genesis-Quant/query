@@ -3,7 +3,7 @@
 import time
 from collections.abc import Callable
 
-from .logging import logger
+from .logging import error_text, logger
 from .throttle import RateLimiter
 
 
@@ -49,14 +49,17 @@ class Retry:
                     )
                 return result
             except Exception as error:
+                reason = error_text(error)
                 if attempt >= self.max_retries:
+                    # 保留脱敏原因，但不把含凭据的第三方异常链传给日志。
                     raise RuntimeError(
                         f"{context} 获取失败，"
-                        f"共尝试 {self.max_retries} 次：{error}"
-                    ) from error
-                logger.exception(
+                        f"共尝试 {self.max_retries} 次：{reason}"
+                    ) from None
+                logger.warning(
                     f"{context} 请求重试："
                     f"attempt={attempt}/{self.max_retries}，"
-                    f"retry_in={self.retry_interval:g}秒"
+                    f"retry_in={self.retry_interval:g}秒，"
+                    f"异常={reason}"
                 )
                 time.sleep(self.retry_interval)

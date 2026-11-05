@@ -4,7 +4,7 @@ from functools import cache
 from typing import Any
 
 import pandas as pd
-import tushare as ts
+import tushare
 
 from query.config import TUSHARE_TOKEN
 
@@ -132,8 +132,8 @@ def get_pro() -> Any:
     """按需初始化并缓存项目唯一的 Tushare Pro 客户端。"""
     if not TUSHARE_TOKEN:
         raise RuntimeError("缺少 TUSHARE_TOKEN，无法初始化 Tushare Pro API")
-    ts.set_token(TUSHARE_TOKEN)
-    client = ts.pro_api(TUSHARE_TOKEN)
+    tushare.set_token(TUSHARE_TOKEN)
+    client = tushare.pro_api(TUSHARE_TOKEN)
     if client is None:
         raise RuntimeError("Tushare Pro API 初始化失败")
     return client
@@ -200,6 +200,18 @@ def get_stock_metadata() -> StockMetadata:
     if _stock_metadata is None:
         _stock_metadata = _load_stock_metadata()
     return _stock_metadata
+
+
+@cache
+def get_company_types() -> dict[str, str]:
+    """将供应商行业映射为财报公司口径，仅用于同版本重复报表的消歧。"""
+    financial = {"银行": "2", "保险": "3", "证券": "4", "多元金融": "7"}
+    metadata = get_stock_metadata()[1]
+    return {
+        str(row.code): financial.get(str(row.industry), "1")
+        for row in metadata.itertuples(index=False)
+        if pd.notna(row.industry) and str(row.industry)
+    }
 
 
 def get_codes() -> tuple[str, ...]:

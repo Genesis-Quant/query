@@ -19,7 +19,6 @@ WORKER_ORDER = (
     "index-daily",
     "index-weight",
 )
-
 WORKER_DESCRIPTIONS = {
     "daily": "全市场未复权日行情",
     "index-daily": "配置指数未复权日行情",
