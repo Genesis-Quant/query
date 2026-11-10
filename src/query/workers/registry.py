@@ -18,6 +18,7 @@ WORKER_ORDER = (
     "fina-indicator",
     "index-daily",
     "index-weight",
+    "barra",
 )
 WORKER_DESCRIPTIONS = {
     "daily": "全市场未复权日行情",
@@ -35,6 +36,7 @@ WORKER_DESCRIPTIONS = {
     "cashflow": "逐股票现金流量表及 TTM 因子",
     "fina-indicator": "逐股票财务指标",
     "index-weight": "指数成分股权重；每个指数创建一个 Worker",
+    "barra": "DSL三级因子、DOS合成与风险估计；按自然年独立重算并上传整段三表",
 }
 
 WORKER_ALIASES = {
@@ -70,6 +72,7 @@ WORKER_ALIASES = {
     "stockfinaindicatorworker": "fina-indicator",
     "indexweight": "index-weight",
     "indexweightworker": "index-weight",
+    "barraworker": "barra",
 }
 
 DATE_WORKERS = frozenset({

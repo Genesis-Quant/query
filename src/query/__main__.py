@@ -6,7 +6,7 @@ import time
 from collections.abc import Sequence
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import dolphindb
 
@@ -27,9 +27,11 @@ class WorkerLogSink(dolphindb.logger.Sink):
     def __init__(self) -> None:
         super().__init__("loguru")
 
+    @override
     def handle(self, message: Any) -> None:
         logger.log(message.level.name, message.log.rstrip("\r\n"))
 
+    @override
     def flush(self) -> None:
         return None
 
@@ -87,13 +89,13 @@ def build_workers_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="列出可用 Worker 后退出",
     )
-    parser.add_argument("--start-date", help="更新起始日期")
+    parser.add_argument("--start-date", help="更新起始日期，Barra默认2016-01-01并按自然年完整重算，其余默认DATA_START_DATE并按水位增量更新")
     parser.add_argument("--end-date", help="更新结束日期，默认今天")
     parser.add_argument(
         "--codes",
         action="append",
         metavar="CODE[,CODE...]",
-        help="限制按代码 Worker 的股票或基金代码，可重复传入",
+        help="限制按代码 Worker 或 Barra 的证券域，可重复传入",
     )
     parser.add_argument(
         "--index-code",
@@ -134,14 +136,14 @@ def build_workers_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help=(
-            "忽略增量水位并重新抓取指定区间；同键数据由 TSDB 保留最新值，"
-            "不会预先删除旧记录"
+            "CoreData忽略增量水位并重算指定区间；"
+            "Barra始终按start/end分年独立重算并上传整段三表，不使用水位"
         ),
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="抓取并校验数据但不创建 writer、不写入数据库",
+        help="抓取并校验数据，不建库、不执行写入",
     )
     parser.add_argument(
         "--log-file",
@@ -207,6 +209,7 @@ def create_workers(
     """根据规范名称创建按执行顺序排列的 Worker 实例。"""
     from query.config import INDEX_CODES
     from query.workers import (
+        BarraWorker,
         FundAdjFactorWorker,
         FundDailyWorker,
         IndexDailyWorker,
@@ -258,7 +261,13 @@ def create_workers(
 
     workers: list[Any] = []
     for name in names:
-        if name == "industry":
+        if name == "barra":
+            barra_arguments = {
+                key: value for key, value in common.items()
+                if key in {"session", "settings", "start_date", "end_date", "batch_size"}
+            }
+            workers.append(BarraWorker(codes=codes, **barra_arguments))
+        elif name == "industry":
             workers.append(IndustryWorker(**common))
         elif name in date_types:
             workers.append(date_types[name](**date_arguments))
@@ -292,10 +301,22 @@ def dry_run_worker(worker: Any) -> int:
     rows = 0
     frames = 0
     logger.info(f"{worker} 开始 dry-run：不会写入数据库")
-    for data in worker.fetch_all():
-        frame = worker.check(data)
-        rows += sum(len(table) for table in frame.values()) if isinstance(frame, dict) else len(frame)
-        frames += 1
+    results = worker.fetch_all()
+    try:
+        for data in results:
+            frame = worker.check(data)
+            rows += sum(len(table) for table in frame.values()) if isinstance(frame, dict) else len(frame)
+            frames += 1
+    finally:
+        failed = sys.exception() is not None
+        close = getattr(results, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception as error:
+                if not failed:
+                    raise
+                logger.warning(f"dry-run失败后回收结果异常：{type(error).__name__}")
     elapsed = time.perf_counter() - started
     logger.success(
         f"{worker} dry-run 完成：结果={rows:,}行，"
@@ -311,8 +332,8 @@ def validate_arguments(
 ) -> None:
     """拒绝对所选 Worker 没有意义的专用参数。"""
     selected = set(names)
-    if arguments.codes and not selected.intersection(STOCK_WORKERS):
-        parser.error("--codes 仅适用于按代码 Worker")
+    if arguments.codes and not selected.intersection(STOCK_WORKERS | {"barra"}):
+        parser.error("--codes 仅适用于按代码 Worker 或 Barra")
     if (
             arguments.index_code
             and not selected.intersection({"index-daily", "index-weight"})
@@ -363,9 +384,10 @@ def run_workers(
         except OSError as error:
             parser.error(f"无法创建运行日志：{type(error).__name__}")
     logger.info(f"Worker 运行日志：{log_path}")
+    owns_session = session is None
     try:
         with ExitStack() as connections:
-            if session is None and not (arguments.dry_run and arguments.overwrite):
+            if session is None and not (arguments.dry_run and arguments.overwrite and "barra" not in names):
                 if not settings.worker_username or not settings.worker_password:
                     raise RuntimeError("缺少 DolphinDB worker 专用账号配置")
                 failures = []
@@ -406,17 +428,22 @@ def run_workers(
                 logger.exception("Worker 初始化失败，未开始执行")
                 parser.error(str(error))
 
+            if owns_session and "barra" in names:
+                from query.execute.api import initialize_query
+
+                initialize_query(session)
             mode = "dry-run" if arguments.dry_run else "写入"
-            if arguments.overwrite:
+            if arguments.overwrite and any(name != "barra" for name in names):
                 logger.warning(
-                    "已启用覆盖模式：忽略增量水位重新获取指定区间；"
-                    "CoreData同键追加覆盖，不会预先删除旧记录"
+                    "CoreData已启用覆盖模式：忽略增量水位重新获取指定区间，同键追加覆盖"
                 )
             logger.info(
                 f"Worker 任务开始：模式={mode}，"
                 f"任务={len(workers):,}，选择={list(names)}"
             )
 
+            if "barra" in names and not arguments.dry_run:
+                logger.warning("Barra始终按start/end分年独立重算，整段校验后替换并上传三表；--codes限制模型证券域，不是个股增补")
             started = time.perf_counter()
             total = 0
             result_name = "校验" if arguments.dry_run else "写入"

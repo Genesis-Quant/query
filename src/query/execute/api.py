@@ -18,8 +18,6 @@ from query.utils import (
     normalize_str_list,
     validate_dolphindb_references,
 )
-from query.workers.core.industry import INDUSTRY_FACTORS
-from query.workers.core.stock_financial import FINANCIAL_FACTORS
 
 from .result import QueryResult
 from .schema import QUERY_RESERVED_REFERENCES, FactorQuery
@@ -49,6 +47,9 @@ def validate_factor_query(request: FactorQuery | dict[str, Any]) -> FactorQuery:
 def query_parameters(
         request: FactorQuery | dict[str, Any], settings: type[DolphinSettings] = DolphinSettings,
 ) -> dict[str, Any]:
+    from query.workers.core.industry import INDUSTRY_FACTORS
+    from query.workers.core.stock_financial import FINANCIAL_FACTORS
+
     validated = validate_factor_query(request)
     start, end = normalize_date_range(validated.start_date, validated.end_date)
     factors = validated.source_factors()
@@ -66,6 +67,7 @@ def query_parameters(
         "factors": np.asarray(factors, dtype=str),
         "industry": np.asarray([name for name in factors if name in INDUSTRY_FACTORS], dtype=str),
         "financial": np.asarray([name for name in factors if name in FINANCIAL_FACTORS], dtype=str),
+        "financialMaxAge": np.int64(-1 if validated.financial_max_age is None else validated.financial_max_age.days),
         "weights": np.asarray([name for name in factors if name.startswith(WEIGHT_PREFIX)], dtype=str),
         "st": IS_ST_FACTOR,
         "definitions": json.dumps({name: node.model_dump(mode="json") for name, node in validated.derivatives.items()},

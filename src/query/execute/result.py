@@ -54,7 +54,7 @@ class QueryResult(SessionResult):
                 for name in names
             ) + "\nNULL")
         finally:
-            self.closed = True
+            super().close()
 
     def __exit__(self, exception_type, exception, traceback) -> bool:
         try:

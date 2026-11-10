@@ -109,6 +109,13 @@ class FactorQuery(BaseModel):
         examples=["P20D"],
     )
 
+    financial_max_age: timedelta | None = Field(
+        default=None,
+        gt=timedelta(0),
+        description="财报原料前填的最长事件年龄；None保持原有无限前填，过期值恢复为NULL。",
+        examples=["P732D"],
+    )
+
     codes: list[str] = Field(
         ...,
         description="需要查询的股票代码；空列表表示全市场。",
@@ -153,6 +160,22 @@ class FactorQuery(BaseModel):
             raise ValueError(f"{info.field_name} 必须是 timedelta 或 TimeDelta 字符串")
         if result < timedelta(0):
             raise ValueError(f"{info.field_name} 不能小于 0")
+        return result
+
+    @field_validator("financial_max_age", mode="before")
+    @classmethod
+    def parse_financial_max_age(cls, value: Any) -> timedelta | None:
+        """只接受正的完整自然日，避免毫秒截断改变有效期边界。"""
+        if value is None:
+            return None
+        if isinstance(value, timedelta):
+            result = value
+        elif isinstance(value, str):
+            result = TypeAdapter(timedelta).validate_python(value)
+        else:
+            raise ValueError("financial_max_age必须是timedelta或TimeDelta字符串")
+        if result <= timedelta(0) or result.seconds or result.microseconds:
+            raise ValueError("financial_max_age必须是正的完整自然日")
         return result
 
     @model_validator(mode="after")

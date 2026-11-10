@@ -351,7 +351,8 @@ class IndustryWorker(BaseWorker):
                 "同一股票同日存在冲突的申万行业归属：" + ", ".join(samples)
             )
 
-    def _validate_intervals(self, data: pd.DataFrame) -> None:
+    @staticmethod
+    def _validate_intervals(data: pd.DataFrame) -> None:
         """拒绝同一股票重叠区间和多个最新行业归属。"""
         flags = data["is_new"].astype("string").str.strip().str.upper()
         if flags.isna().any() or flags.eq("").any():

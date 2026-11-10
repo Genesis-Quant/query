@@ -1,5 +1,6 @@
-"""导出CoreData基础数据Worker。"""
+"""导出CoreData基础数据和Barra风险模型Worker。"""
 
+from .barra import BarraWorker
 from .core import (
     BaseWorker,
     DateWorker,
@@ -23,7 +24,7 @@ from .core import (
 )
 
 __all__ = [
-    "BaseWorker", "DateWorker", "StockWorker", "FundAdjFactorWorker", "FundDailyWorker",
+    "BarraWorker", "BaseWorker", "DateWorker", "StockWorker", "FundAdjFactorWorker", "FundDailyWorker",
     "IndustryWorker", "IndexDailyWorker", "IndexWeightWorker", "StockAdjFactorWorker",
     "StockBalanceSheetWorker", "StockCashflowWorker", "StockDailyBasicWorker",
     "StockDailyWorker", "StockFinaIndicatorWorker", "StockHfqWorker", "StockIncomeWorker",

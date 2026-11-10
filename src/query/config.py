@@ -38,6 +38,7 @@ class WorkerSettings(DolphinSettings):
         ).split(",") if endpoint.strip()
     )
     username = os.getenv("DOLPHINDB_USERNAME") or os.getenv("DOLPHIN_RUNTIME_USERNAME")
+    password = os.getenv("DOLPHINDB_PASSWORD") or os.getenv("DOLPHIN_RUNTIME_PASSWORD")
     worker_username = os.getenv("DOLPHINDB_WORKER_USERNAME") or os.getenv("DOLPHIN_WORKER_USERNAME")
     worker_password = os.getenv("DOLPHINDB_WORKER_PASSWORD") or os.getenv("DOLPHIN_WORKER_PASSWORD")
 
@@ -45,6 +46,7 @@ class WorkerSettings(DolphinSettings):
 class BarraConfig:
     """教程因子关系及已确认的日频参数；同样直接传递配置类。"""
 
+    start_date = "2016-01-01"
     benchmark = "000985.CSI"
     industry_level = 1
     financial_page_size = 10_000
@@ -87,7 +89,14 @@ class BarraConfig:
     eigen_adjustment = False
     min_listing_days = 60
     min_specific_observations = 60
+    specific_peer_fallback = True
+    specific_peer_min_stocks = 5
+    specific_short_observations = 20
     variance_floor = 1e-8
     history_years = 6
     report_years = 2
     price_window = 1324
+    minimum_factor_coverage = 0.5
+    minimum_stocks = 40
+    minimum_risk_observations = 60
+    exposure_limit = 5.0

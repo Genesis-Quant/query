@@ -64,8 +64,8 @@ FILL_OBSERVED_GROUP_NULL_COLUMN = DolphinDBFunction(
 FORWARD_FILL_COLUMN = DolphinDBFunction(
     module="query",
     definition="""
-    def forward_fill_column(mutable source, name, groups, order) {
-        // 按 groups 分组并按 order 排序，对单列执行前向填充。
+    def forward_fill_column(mutable source, name, groups, order, maxAge=-1) {
+        // maxAge只限制显式请求的财报事件年龄；默认不改变已有前填语义。
         require_table_columns(source, [string(name)], "forward_fill_column")
         if (!is_vector_form(groups) || size(groups) != source.rows()) {
             throw "forward_fill_column 的 groups 必须与 source 等长"
@@ -73,12 +73,17 @@ FORWARD_FILL_COLUMN = DolphinDBFunction(
         if (!is_vector_form(order) || size(order) != source.rows()) {
             throw "forward_fill_column 的 order 必须与 source 等长"
         }
-        source[string(name)] = contextby(
-            ffill,
-            source[string(name)],
-            groups,
-            order
-        )
+        values = source[string(name)]
+        if (maxAge < 0) {
+            source[string(name)] = contextby(ffill, values, groups, order)
+            return source
+        }
+        valid = isValid(values) && !isNanInf(double(values),true)
+        observed = iif(valid,timestamp(order),timestamp(NULL))
+        lastObserved = contextby(ffill,observed,groups,order)
+        filled = contextby(ffill,iif(valid,double(values),double(NULL)),groups,order)
+        age = date(order)-date(lastObserved)
+        source[string(name)] = iif(!isNull(lastObserved) && age>=0 && age<=maxAge,filled,double(NULL))
         return source
     }
     """,
@@ -398,11 +403,16 @@ APPLY_ROLLING_OLS = DolphinDBFunction(
                 return transpose(output)
             }
         }
-        for (current_code in distinct(selected.code)) {
-            rows = select row_id, time from selected where code = current_code order by time, row_id
-            indices = rows.row_id
+        // selected已按code/time/row_id排序；一次定位组边界，避免每只股票重扫整张历史表。
+        groups = select count(*) as rows from selected group by code order by code
+        ends = cumsum(groups.rows)
+        begins = ends - groups.rows
+        for (group in 0 : groups.rows()) {
+            first = begins[group]
+            last = ends[group]
+            indices = selected.row_id[first:last]
             coefficients = rolling_controls_regression(
-                input_target[indices], input_controls[indices], window, min_periods, intercept, rows.time,
+                input_target[indices], input_controls[indices], window, min_periods, intercept, selected.time[first:last],
                 method, weights, binary
             )
             for (name in coefficients.columnNames()) {
@@ -590,7 +600,8 @@ BUILD_FIXED_CODE_FACTOR_SOURCE = DolphinDBFunction(
             target_factors,
             times,
             start_time,
-            end_time) {
+            end_time,
+            financialMaxAge=-1) {
         // 在外部证券自己的时间线上按基础字段默认填充，再对齐原面板；不添加证券行。
         financial_factors = __FINANCIAL_FACTORS__
         industry_factors = __INDUSTRY_FACTORS__
@@ -633,10 +644,12 @@ BUILD_FIXED_CODE_FACTOR_SOURCE = DolphinDBFunction(
                     reference = forward_fill_column(
                         reference, column, reference.code, reference.time
                     )
-                } else if (column in financial_factors || column in industry_factors) {
+                } else if (column in financial_factors) {
                     reference = forward_fill_column(
-                        reference, column, reference.code, reference.time
+                        reference, column, reference.code, reference.time, financialMaxAge
                     )
+                } else if (column in industry_factors) {
+                    reference = forward_fill_column(reference, column, reference.code, reference.time)
                 }
                 mapping = dict(timestamp(reference.time), double(reference[column]))
                 result[aliases[i]] = mapping[timestamp(times)]
@@ -657,7 +670,8 @@ BUILD_FACTOR_SOURCE = DolphinDBFunction(
             factors,
             dates,
             start_time,
-            end_time) {
+            end_time,
+            financialMaxAge=-1) {
         if (!is_vector_form(factors) || (size(factors) > 0 && type(factors) != STRING)) {
             throw "build_factor_source 的 factors 必须是 STRING 向量"
         }
@@ -692,7 +706,7 @@ BUILD_FACTOR_SOURCE = DolphinDBFunction(
         if (size(references) > 0) {
             fixed = build_fixed_code_factor_source(
                 data, references, reference_codes, reference_factors,
-                result.time, start_time, end_time
+                result.time, start_time, end_time, financialMaxAge
             )
             for (name in references) result[name] = fixed[name]
         }

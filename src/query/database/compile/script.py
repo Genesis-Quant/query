@@ -77,13 +77,16 @@ def buildQuery(request) {
             where factor = symbol([column])[0], time >= request.start, time < request.end
         timeline = sort(distinct(timeline join observedDates))
     }
+    financialMaxAge = -1l
+    if ("financialMaxAge" in request) financialMaxAge = long(request.financialMaxAge)
     source = build_factor_source(
         sourceTable,
         request.codes,
         request.factors,
         timeline,
         request.start,
-        request.end
+        request.end,
+        financialMaxAge
     )
     source[`selected] = source.time in calendar
 
@@ -99,7 +102,9 @@ def buildQuery(request) {
                 source[column]
             )
             source = forward_fill_column(source, column, source.code, source.time)
-        } else if (column in request.financial || column in request.industry) {
+        } else if (column in request.financial) {
+            source = forward_fill_column(source, column, source.code, source.time, financialMaxAge)
+        } else if (column in request.industry) {
             source = forward_fill_column(source, column, source.code, source.time)
         }
     }

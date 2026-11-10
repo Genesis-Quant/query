@@ -1,4 +1,4 @@
-"""独立 Barra 库的三张长表、权限、完整日写入与增量读取。"""
+"""独立Barra库的三张长表；完整年段校验后替换并上传。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from query.config import DolphinSettings
+from query.config import BarraConfig, DolphinSettings
 
 from .core import grant_runtime_table_read
 
@@ -20,11 +20,12 @@ COLUMNS = {
 
 
 class BarraTableWriter:
-    """按交易日完整替换三表；不把单表最大日期当作完整进度。"""
+    """一次接收已算完的年段三表；不读取旧结果作为计算输入。"""
 
     def __init__(self, session: Any, *, settings: type[DolphinSettings] = DolphinSettings,
-                 batch_size: int = 800_000) -> None:
+                 config: type[BarraConfig] = BarraConfig, batch_size: int = 800_000) -> None:
         self.session, self.settings, self.batch_size = session, settings, batch_size
+        self.config = config
         self.tables = {
             "exposures": settings.barra_table,
             "covariance": settings.barra_cov_table,
@@ -80,41 +81,25 @@ class BarraTableWriter:
             types = ("TIMESTAMP", *("SYMBOL" for _ in columns[1:-1]), "DOUBLE")
             if tuple(definitions["name"]) != columns or tuple(definitions["typeString"]) != types:
                 raise ValueError(f"已有{table}结构不符，不会覆盖")
-            grant_runtime_table_read(self.session, settings.barra_database, table, settings)
+            if getattr(settings, "username", None):
+                grant_runtime_table_read(self.session, settings.barra_database, table, settings)
         self.prepared = True
 
-    def summaries(self, start: pd.Timestamp, end: pd.Timestamp) -> dict[str, pd.DataFrame]:
-        """只读检查区间中的缺日与三表覆盖，不建库、不写入。"""
-        self.session.upload({"barraStart": np.datetime64(start, "ms"),
-                             "barraEnd": np.datetime64(end, "ms")})
-        dimensions = {
-            "exposures": "count(*) as rows,nunique(code) as codes,nunique(factor) as factors",
-            "covariance": "count(*) as rows,nunique(factor1) as factors,nunique(factor2) as factors2",
-            "specific": "count(*) as rows,nunique(code) as codes",
-        }
-        results = {}
-        for name, table in self.tables.items():
-            results[name] = self.session.run(f"""
-                select {dimensions[name]} from loadTable(
-                    {json.dumps(self.settings.barra_database)},{json.dumps(table)})
-                where time>=barraStart,time<=barraEnd group by time order by time
-            """) if self.exists(name) else pd.DataFrame()
-        return results
+    @staticmethod
+    def check(data: dict[str, pd.DataFrame], *, config: type[BarraConfig] = BarraConfig,
+              calendar: pd.DatetimeIndex | None = None) -> None:
+        """整段上传前逐日核对真实模型轴、三表日期和半正定协方差。"""
+        from query.workers.core.industry import SW_LEVEL1_TO_LEVEL0, IndustryLevel0
 
-    def read_exposures(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-        if not self.exists("exposures"):
-            return pd.DataFrame(columns=COLUMNS["exposures"])
-        self.session.upload({"barraStart": np.datetime64(start, "ms"),
-                             "barraEnd": np.datetime64(end, "ms")})
-        return self.session.run(f"""
-            select time,code,factor,value from loadTable(
-                {json.dumps(self.settings.barra_database)},{json.dumps(self.tables['exposures'])})
-            where time>=barraStart,time<=barraEnd order by time,code,factor
-        """)
-
-    def check(self, data: dict[str, pd.DataFrame]) -> None:
-        """写入前验证唯一键、同日覆盖、有限值及完整半正定协方差。"""
-        dates = set()
+        if config.industry_level == 1:
+            industries = {int(code.split('.')[0]) for code in SW_LEVEL1_TO_LEVEL0}
+        elif config.industry_level == 0:
+            industries = {int(value) for value in IndustryLevel0 if value != IndustryLevel0.UNKNOWN}
+        else:
+            raise ValueError("Barra行业层级只支持已有的0级或申万1级编码")
+        expected = {"country", *config.styles, *(f"industry_{value}" for value in industries)}
+        dates = None
+        grouped = {}
         for name, columns in COLUMNS.items():
             frame = data[name]
             if tuple(frame.columns) != columns or frame.empty:
@@ -123,42 +108,79 @@ class BarraTableWriter:
                 raise ValueError(f"{name}存在空键或重复键")
             if not np.isfinite(frame["value"].to_numpy(dtype=float)).all():
                 raise ValueError(f"{name}有非有限值")
-            dates.update(pd.Timestamp(date) for date in frame["time"].unique())
-        if len(dates) != 1:
-            raise ValueError("三表必须是同一个交易日")
-        x, f, d = data["exposures"], data["covariance"], data["specific"]
-        codes, factors = set(x["code"]), sorted(set(x["factor"]))
-        if len(x) != len(codes)*len(factors) or codes != set(d["code"]):
-            raise ValueError("股票暴露与特异风险覆盖不一致")
-        if not d["value"].gt(0).all() or len(f) != len(factors)**2:
-            raise ValueError("特异方差不为正或因子协方差不完整")
-        matrix = f.pivot(index="factor1", columns="factor2", values="value").reindex(index=factors, columns=factors).to_numpy()
-        if not np.isfinite(matrix).all() or not np.allclose(matrix, matrix.T, atol=1e-12):
-            raise ValueError("因子协方差缺值或不对称")
-        if np.linalg.eigvalsh(matrix).min() < -1e-10:
-            raise ValueError("因子协方差不是半正定矩阵")
+            clock = pd.DatetimeIndex(frame["time"])
+            if clock.tz is not None or not clock.equals(clock.normalize()):
+                raise ValueError(f"{name}日期必须是无时区交易日零点")
+            current = clock.as_unit("ms").unique().sort_values()
+            if current[0].year != current[-1].year:
+                raise ValueError("Barra单次上传必须位于同一个自然年内")
+            if dates is not None and not current.equals(dates):
+                raise ValueError("Barra三表的交易日集合不一致")
+            dates = current
+            grouped[name] = frame.groupby("time", sort=True)
+        if calendar is not None and not dates.equals(pd.DatetimeIndex(calendar).as_unit("ms")):
+            raise ValueError("Barra结果交易日与本段目标日历不一致")
+        factors = set(data["exposures"]["factor"])
+        if factors != expected:
+            raise ValueError(f"Barra模型因子轴不符：缺失={sorted(expected-factors)}，多余={sorted(factors-expected)}")
+        for current, x in grouped["exposures"]:
+            f = grouped["covariance"].get_group(current)
+            d = grouped["specific"].get_group(current)
+            codes = set(x["code"])
+            style = x.loc[x["factor"].isin(config.styles), "value"]
+            if style.abs().gt(config.exposure_limit + 1e-12).any():
+                raise ValueError(f"Barra {current}风格暴露超过质量上限")
+            country = x.loc[x["factor"].eq("country"), "value"]
+            if not country.eq(1.0).all():
+                raise ValueError(f"Barra {current}国家因子必须为1")
+            industry = x.loc[x["factor"].str.startswith("industry_")]
+            if not industry.empty and (
+                not industry["value"].isin([0.0, 1.0]).all()
+                or not industry.groupby("code")["value"].sum().eq(1.0).all()
+            ):
+                raise ValueError(f"Barra {current}行业暴露必须为唯一独热编码")
+            if set(x["factor"]) != factors or len(x) != len(codes)*len(factors) or codes != set(d["code"]):
+                raise ValueError(f"Barra {current}股票暴露与特异风险覆盖不一致")
+            if not d["value"].gt(0).all() or len(f) != len(factors)**2:
+                raise ValueError(f"Barra {current}特异方差不为正或因子协方差不完整")
+            if set(f["factor1"]) != factors or set(f["factor2"]) != factors:
+                raise ValueError(f"Barra {current}协方差与暴露的因子轴不一致")
+            axis = sorted(factors)
+            matrix = f.pivot(index="factor1", columns="factor2", values="value").reindex(index=axis, columns=axis).to_numpy()
+            if not np.isfinite(matrix).all() or not np.allclose(matrix, matrix.T, atol=1e-12):
+                raise ValueError(f"Barra {current}因子协方差缺值或不对称")
+            if np.linalg.eigvalsh(matrix).min() < -1e-10:
+                raise ValueError(f"Barra {current}因子协方差不是半正定矩阵")
 
     def write(self, data: dict[str, pd.DataFrame]) -> int:
-        """完整替换一天；失败立即停止，下一次从最早异常或尾日重放。"""
+        """先校验完整分段，再替换该段三表；不宣称跨表原子事务。"""
         self.partial_write_rows = 0
-        self.check(data)
+        self.check(data, config=self.config)
         self.prepare()
-        date = pd.Timestamp(data["exposures"]["time"].iloc[0])
-        self.session.upload({"barraDate": np.datetime64(date, "ms")})
-        # 不宣称跨三表原子事务；数据消费者在更新任务成功后读取。
-        for name, table in self.tables.items():
-            target = f"loadTable({json.dumps(self.settings.barra_database)},{json.dumps(table)})"
-            self.session.run(f"delete from {target} where time=barraDate")
+        dates = pd.DatetimeIndex(data["exposures"]["time"]).as_unit("ms").unique().sort_values()
+        self.session.upload({"barraWriteDates": dates.to_numpy(dtype="datetime64[ms]")})
+        targets = {
+            name: f"loadTable({json.dumps(self.settings.barra_database)},{json.dumps(table)})"
+            for name, table in self.tables.items()
+        }
+        for target in targets.values():
+            self.session.run(f"select count(*) as rows,min(time) as first_date,max(time) as last_date from {target} where time in barraWriteDates")
+        for name, target in targets.items():
+            self.session.run(f"delete from {target} where time in barraWriteDates")
             frame = data[name]
             for offset in range(0, len(frame), self.batch_size):
                 batch = frame.iloc[offset:offset+self.batch_size].copy()
                 batch["time"] = pd.to_datetime(batch["time"]).astype("datetime64[ms]")
                 self.session.upload({"barraBatch": batch})
                 written = int(self.session.run(f"tableInsert({target},barraBatch)"))
-                if written != len(batch):
-                    raise RuntimeError(f"{table}批次写入数量不符")
                 self.partial_write_rows += written
-            count = int(self.session.run(f"exec count(*) from {target} where time=barraDate"))
-            if count != len(frame):
-                raise RuntimeError(f"{table}当日写入校验失败")
+                if written != len(batch):
+                    raise RuntimeError(f"{self.tables[name]}批次写入数量不符")
+            actual = self.session.run(f"""
+                select count(*) as rows from {target}
+                where time in barraWriteDates group by time order by time
+            """)
+            expected = frame.groupby("time", sort=True).size()
+            if not pd.DatetimeIndex(actual["time"]).as_unit("ms").equals(pd.DatetimeIndex(expected.index).as_unit("ms")) or not np.array_equal(actual["rows"].to_numpy(), expected.to_numpy()):
+                raise RuntimeError(f"{self.tables[name]}整段逐日写入数量校验失败")
         return self.partial_write_rows
